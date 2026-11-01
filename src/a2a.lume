@@ -1,0 +1,496 @@
+// src/a2a.lume — 节点间的 A2A 交换核心(任务状态机 + Agent Card + 派发)
+//
+// 这个文件是「节点在收到一条 A2A 消息之后做什么」的**唯一**实现:
+//   * HTTP 路由(node.lume)只负责解析/验签/写收回执;
+//   * 状态怎么流转、能力怎么被选中、结果长什么样, 全在这里。
+//
+// ── 消息的三种走法 ──────────────────────────────────────────────────
+//   direct  (默认) : 本节点直接执行, 一条 message/send 走完(同步, 返回 Task)
+//   async          : 只登记任务并返回 submitted, 由宿主 worker 推进
+//                    (lume 没有 spawn/exec, 后台执行只能交给宿主进程)
+//   relay          : 本节点不执行, 转给下一个节点(多跳 peer 链)。用 `hops`
+//                    记录跳数并硬上限, 防止 A↔B 互转把两个节点打死。
+//
+// ── 为什么任务要落盘 ────────────────────────────────────────────────
+// 任务分布在多个节点上, 前端要能「沿着 trace 看它去了哪」。状态放文件
+// (.data/a2a-tasks/<id>.json) 而不是进程内存: workers=2 时内存是两份,
+// 而且重启即丢 —— 演示节点重启后任务还挂在 submitted, 是最容易被当成 bug 的现象。
+import "../../lume-core/lib/peer.lume" as peer;
+import "catalog.lume" as catalog;
+import "proto_encode.lume" as enc;
+import "graph.lume" as graph;
+import "sector.lume" as sector;
+import "fleet.lume" as fleet;
+
+// 启动时刻。必须在这里声明而不是文件末尾: lume 的顶层按声明顺序求值,
+// 而 cap_overview() 在第一个请求到达时就会读它。声明在函数之后会让
+// `--check` 报 "undefined variable"(实测), 因为检查发生在声明语句之前。
+let started_at = int(now());
+
+// 任务目录按节点名隔离。
+//
+// 为什么要隔离: 两个节点如果从同一个仓库目录启动(.data 相同), 共用一份任务
+// 目录会互相"看到对方的任务" —— 实测 node-b 的 /api/state 里出现了 node-a 的
+// 任务, 而且 tasks/get 能把别的节点的任务查出来。演示场景里这就是数据串了,
+// 生产里则是越权读取。目录名带节点名, 一步到位。
+let task_dir = ".data/a2a-tasks/" + str(peer.node_info()["name"]);
+let ttl_secs = env("A2A_TASK_TTL_SECS");
+if (ttl_secs == null) { ttl_secs = "7200"; }
+
+// 多跳上限。3 跳 = A→B→C→D。超过直接拒, 而不是"尽力转发":
+// 环路的代价是节点互相打, 表现是 CPU 100% 而日志里每行都正常。
+let MAX_HOPS = 3;
+
+let self_bind = env("PEER_BIND");
+if (self_bind == null) { self_bind = "127.0.0.1"; }
+let self_port = env("PEER_PORT");
+if (self_port == null) { self_port = "18190"; }
+let public_url = env("PEER_PUBLIC_URL");
+if (public_url == null) { public_url = ""; }
+
+// ── 身份 ────────────────────────────────────────────────────────────
+export func node_name(): string {
+  return str(peer.node_info()["name"]);
+}
+
+// 本节点对外可被连上的地址。客户端会**直接拿这个地址发请求**, 所以
+// 绑 0.0.0.0 时不能原样宣告(客户端连不上), 这里回落成 127.0.0.1 并
+// 在 card 里给出 warning(见 card())。
+export func base_url(): string {
+  if (len(public_url) > 0) { return public_url; }
+  let host = self_bind;
+  if (host == "0.0.0.0" or host == "::" or len(host) == 0) { host = "127.0.0.1"; }
+  return "http://" + host + ":" + self_port;
+}
+
+// ── 任务存储 ────────────────────────────────────────────────────────
+func ensure_dir() { mkdir(task_dir); }
+
+// id 只允许 [a-z0-9_-]: 任务 id 会拼进文件路径, 这是路径穿越的唯一入口。
+func task_path(id: string): string {
+  if (len(id) == 0 or len(id) > 64) { return ""; }
+  if (len(str_match("^[A-Za-z0-9_-]+$", id)) == 0) { return ""; }
+  return task_dir + "/" + id + ".json";
+}
+
+// 写任务。用文件锁串行化写: workers=2 时两个请求可能同时改同一个任务
+// (客户端轮询 + worker 推进), 无锁会出现「后写的覆盖先写的」。
+// 没有 rename 内建, 所以原子性降级为「锁内整写」; 读侧用 try() 接住半截 JSON。
+func save(task) {
+  ensure_dir();
+  let id = str(get(task, "id", ""));
+  let p = task_path(id);
+  if (len(p) == 0) { return false; }
+  let lockp = task_dir + "/.lock";
+  let locked = lock_file(lockp);
+  let ok = write_file(p, stringify(task));
+  if (locked != null and locked != false) { unlock_file(lockp); }
+  return ok != null and ok != false;
+}
+
+export func load(id: string) {
+  let p = task_path(id);
+  if (len(p) == 0) { return null; }
+  let txt = read_file(p);
+  if (txt == null) { return null; }
+  let r = try(() => json(txt));
+  if (r.err != null or r.ok == null) { return null; }
+  return r.ok;
+}
+
+// 最近若干个任务(按 updated 倒序)。前端「最近任务」用它。
+export func recent(n: int) {
+  ensure_dir();
+  let names = files(task_dir);
+  let out = [];
+  let i = 0;
+  while (i < len(names)) {
+    let nm = str(get(names, i, ""));
+    if (len(nm) > 5) {
+      let m = str_match("^([A-Za-z0-9_-]+)\\.json$", nm);
+      if (m != null and len(m) > 0) {
+        let g = get(get(m, 0, {}), "groups", []);
+        let t = load(str(get(g, 0, "")));
+        if (t != null) { push(out, t); }
+      }
+    }
+    i = i + 1;
+  }
+  return sort_recent(out, n);
+}
+
+// 按 updated 时间倒序取前 n 条。sort() 只对同类列表排序, 这里手写插入排序:
+// 任务数量是演示量级(几十), 不需要更复杂的排序。
+func sort_recent(list, n: int) {
+  let a = [];
+  let i = 0;
+  while (i < len(list)) {
+    let t = get(list, i, {});
+    let ts = int(get(t, "updated", 0));
+    let pos = 0;
+    let placed = false;
+    while (pos < len(a) and not placed) {
+      if (int(get(get(a, pos, {}), "updated", 0)) < ts) {
+        a = insert_at(a, pos, t);
+        placed = true;
+      }
+      pos = pos + 1;
+    }
+    if (not placed) { push(a, t); }
+    i = i + 1;
+  }
+  if (len(a) > n) { return slice(a, 0, n); }
+  return a;
+}
+
+func insert_at(a, pos: int, v) {
+  let out = [];
+  let i = 0;
+  while (i < pos) { push(out, get(a, i, null)); i = i + 1; }
+  push(out, v);
+  while (i < len(a)) { push(out, get(a, i, null)); i = i + 1; }
+  return out;
+}
+
+func slice(a, start: int, end: int) {
+  let out = [];
+  let i = start;
+  while (i < end and i < len(a)) { push(out, get(a, i, null)); i = i + 1; }
+  return out;
+}
+
+// ── A2A 任务模型 ────────────────────────────────────────────────────
+// Task 是 A2A 的**可查询承诺**: 客户端拿到 id 之后, 无论中间发生什么,
+// 都能用 tasks/get 问出"现在到哪一步了"。所以任务一创建就落盘, 而不是
+// 执行完才写 —— 长任务执行中崩掉时, 客户端看到的是 working(可能卡住),
+// 比看到"task not found"更好排查。
+
+// 状态值域取自 A2A 规范, 不自造。
+let STATE_ACTIVE = ["submitted", "working"];
+let STATE_DONE = ["completed", "failed", "canceled", "rejected", "input-required"];
+
+export func is_terminal(state: string): bool {
+  if (state == "completed") { return true; }
+  if (state == "failed") { return true; }
+  if (state == "canceled") { return true; }
+  if (state == "rejected") { return true; }
+  return false;
+}
+
+// 新建任务。payload 不是规范字段, 塞进 metadata(规范允许客户端忽略扩展)。
+export func new_task(ctx_id: string, capability: string, text: string, hops: int) {
+  let id = peer.new_task_id();
+  if (len(ctx_id) == 0) { ctx_id = peer.new_message_id(); }
+  let t = {
+    id: id,
+    contextId: ctx_id,
+    kind: "task",
+    status: { state: "submitted", timestamp: str(now()) },
+    artifacts: [],
+    history: [message("user", text)],
+    metadata: {
+      capability: capability,
+      hops: hops,
+      trace: [{ node: node_name(), at: int(now()), cap: capability,
+                note: "accepted", hops: hops }],
+    },
+    node: node_name(),
+    created: int(now()),
+    updated: int(now()),
+  };
+  save(t);
+  return t;
+}
+
+func message(role: string, text: string) {
+  let mid = peer.new_message_id();
+  return { role: role, messageId: mid, kind: "message",
+           parts: [{ kind: "text", text: text }] };
+}
+
+// 状态流转。`note` 会追加到 trace, 前端据此画「这任务在每个节点上发生了什么」。
+export func advance(id: string, state: string, artifacts, note: string) {
+  let t = load(id);
+  if (t == null) { return null; }
+  let st = get(t, "status", {});
+  st = put(st, "state", state);
+  st = put(st, "timestamp", str(now()));
+  let t2 = put(t, "status", st);
+  if (artifacts != null) { t2 = put(t2, "artifacts", artifacts); }
+  let tr = get(t2, "metadata", {});
+  let trace = get(tr, "trace", []);
+  if (len(note) > 0) {
+    push(trace, { node: node_name(), at: int(now()), note: note,
+                  hops: get(tr, "hops", 0), cap: get(tr, "capability", "") });
+  }
+  tr = put(tr, "trace", trace);
+  t2 = put(t2, "metadata", tr);
+  t2 = put(t2, "updated", int(now()));
+  save(t2);
+  return t2;
+}
+
+func artifact(text: string) {
+  return { artifactId: peer.new_message_id(), parts: [{ kind: "text", text: text }] };
+}
+
+// ── Agent Card ──────────────────────────────────────────────────────
+// 按 A2A v1.0: 能力端点在 supportedInterfaces 数组里; 同时保留 v0.3 的 url
+// 兜底(老客户端只认 url)。两者都写, 代价是几行 JSON, 收益是不用让调用方猜版本。
+export func card() {
+  let base = base_url();
+  let warn = "";
+  if (self_bind == "0.0.0.0" and len(public_url) == 0) {
+    warn = "节点绑定 0.0.0.0 但未设 PEER_PUBLIC_URL: card 宣告 " + base +
+           ", 跨机客户端请把 PEER_PUBLIC_URL 设成本机可达地址";
+  }
+  return {
+    name: node_name(),
+    description: "Lume A2A 演示节点: 展示 peer 之间如何发现(Agent Card)、" +
+                 "签名调用(message/send)、多跳转发与任务生命周期。" +
+                 "只做只读/转发, 不提供任何写入或执行能力。",
+    version: "1.0.0",
+    protocolVersion: "1.0",
+    supportedInterfaces: [
+      { protocolVersion: "1.0", protocolBinding: "JSONRPC", url: base + "/a2a" },
+    ],
+    url: base + "/a2a",
+    capabilities: { streaming: true, pushNotifications: false, agent_backed: false },
+    defaultInputModes: ["text/plain", "application/json"],
+    defaultOutputModes: ["text/plain", "application/json"],
+    skills: catalog.as_skills(),
+    warnings: warn,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 派发 —— 「收到一条消息」之后做什么
+// ══════════════════════════════════════════════════════════════════════
+//
+// 输入统一是 { capability, text, args, hops }:
+//   * 来自 A2A 的 message/send 时, capability 由 params.metadata.capability 指定;
+//   * 未指定时按文本关键词猜(见 guess_cap), 猜不出则回 input-required。
+//
+// 输出统一是 { state, artifacts, note } —— 调用方据此写任务状态。
+//
+// ══ 收敛说明 ═══════════════════════════════════════════════════════
+// 原先这里有 7 个演示能力(echo / aggregate / relay / plan / report / batch)。
+// 它们只为让协议跑通而造, 没有任何业务含义, 留着会让 Agent Card 对外撒谎。
+// 现在只保留本节点**真做的事**, 且全部只到行业/实体级别, 不含个股买卖方向。
+
+// 按关键词推荐能力。给 A2A 客户端一个"不指定 capability 也能用"的入口。
+//
+// 保守: 认不出就返回空串, 由调用方回 input-required 让客户端明确指定。
+// 猜错的代价是"看起来成功了但答非所问", 比多问一轮糟。
+export func guess_cap(text: string): string {
+  let t = lower(text);
+  if (len(str_match("动向|异动|行情|行业|movement|sector", t)) > 0) { return "sector.movement"; }
+  if (len(str_match("客户|覆盖|触达|reach|customer", t)) > 0) { return "customer.reach"; }
+  if (len(str_match("实体|信用代码|uscc|代码|entity|resolve", t)) > 0) { return "entity.resolve"; }
+  if (len(str_match("能力|概况|你是谁|自检|capability|status", t)) > 0) { return "node.capabilities"; }
+  return "";
+}
+
+export func dispatch(cap_name: string, text: string, args, hops: int) {
+  // args 来自 JSON 解码/上游透传, 可能是 null 或非 map。这里统一收敛成 map:
+  // 每个能力门里再各自判空的话, 漏一处就是 500(get(null, "k") 直接抛错)。
+  if (args == null or len(str_match("^\\{", stringify(args))) == 0) { args = {}; }
+  if (cap_name == "node.capabilities") { return cap_self(); }
+  if (cap_name == "sector.movement") { return cap_sector(args); }
+  if (cap_name == "customer.reach") { return cap_reach(args); }
+  if (cap_name == "entity.resolve") { return cap_entity(args); }
+  return { state: "rejected", artifacts: [],
+           note: "unknown capability '" + cap_name + "'" };
+}
+
+// ── node.capabilities: 自检 ─────────────────────────────────────────
+// 对端在调用前想知道"你是谁、数据基础如何"。返回的都是能公开的元信息。
+func cap_self() {
+  let up = int(now()) - started_at;
+  let idx = graph.stats();
+  let body = {
+    node: node_name(),
+    uptime_secs: up,
+    mode: peer.key_mode(),
+    capabilities: catalog.all(),
+    // 数据基础: 实体索引覆盖多少, 直接决定行业画像可信度
+    entity_index: { entities: get(idx, "entities", 0), with_uscc: get(idx, "with_uscc", 0) },
+    boundary: "只到行业与实体级别, 不返回个股代码或买卖方向",
+  };
+  return { state: "completed", artifacts: [artifact(stringify(body))], note: "self check" };
+}
+
+// ── sector.movement: 行业级动向 ─────────────────────────────────────
+// 只到行业, 不下探个股。这是它与"选股"的分界线。
+func cap_sector(args) {
+  let want = str(get(args, "industry", ""));
+  let rows = sector.scan();
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let r = get(rows, i, {});
+    if (len(want) == 0 or str(get(r, "industry", "")) == want) {
+      // 白名单式挑选字段: 只输出行业级聚合, 不转发任何代码/名称
+      push(out, {
+        industry: str(get(r, "industry", "")),
+        sample: int(get(r, "count", 0)),
+        up: int(get(r, "up", 0)),
+        down: int(get(r, "down", 0)),
+        avg_change: get(r, "avg_change", 0),
+        has_momentum: get(r, "has_momentum", false),
+        avg_momentum: get(r, "avg_momentum", 0),
+        headline: str(get(r, "headline", "")),
+      });
+    }
+    i = i + 1;
+  }
+  if (len(out) == 0) {
+    return { state: "failed", artifacts: [],
+             note: "行业 '" + want + "' 无可用画像(实体索引未覆盖或数据源不可用)" };
+  }
+  let body = { industries: out, count: len(out),
+               boundary: "行业级聚合, 不含任何证券代码" };
+  return { state: "completed", artifacts: [artifact(stringify(body))],
+           note: str(len(out)) + " 个行业的动向" };
+}
+
+// ── customer.reach: 行业客户覆盖 ────────────────────────────────────
+// 转 crm 节点。只给计数, 不给客户明细 —— 那是 crm 的边界。
+func cap_reach(args) {
+  let industry = str(get(args, "industry", ""));
+  if (len(industry) == 0) {
+    return { state: "failed", artifacts: [], note: "缺少 industry 参数" };
+  }
+  let r = fleet.invoke("crm", "crm.industries", 20);
+  if (!get(r, "ok", false)) {
+    return { state: "failed", artifacts: [],
+             note: "crm 不可用: " + str(get(r, "error", "")) };
+  }
+  let rows = get(get(r, "result", {}), "industries", []);
+  let i = 0;
+  while (i < len(rows)) {
+    let x = get(rows, i, {});
+    if (str(get(x, "industry", "")) == industry) {
+      let body = { industry: industry, customers: int(get(x, "customers", 0)),
+                   note: "仅有计数; 客户明细不在 peer 面提供" };
+      return { state: "completed", artifacts: [artifact(stringify(body))],
+               note: industry + ": " + str(get(x, "customers", 0)) + " 个客户" };
+    }
+    i = i + 1;
+  }
+  return { state: "completed",
+           artifacts: [artifact(stringify({ industry: industry, customers: 0 }))],
+           note: industry + " 当前无客户" };
+}
+
+// ── entity.resolve: 实体解析 ────────────────────────────────────────
+// 按 USCC / 证券代码 / 已登记别名解析。未登记的名称不做模糊匹配。
+func cap_entity(args) {
+  let r = graph.resolve(
+    str(get(args, "name", "")),
+    str(get(args, "uscc", "")),
+    str(get(args, "code", "")));
+  let body = {
+    status: str(get(r, "status", "")),
+    method: str(get(r, "method", "")),
+    code: str(get(r, "code", "")),
+    reason: str(get(r, "reason", "")),
+  };
+  let rec = get(r, "record", null);
+  if (rec != null) {
+    // 实体记录本身是工商公开信息, 可以出
+    body = put(body, "name", str(get(rec, "name", "")));
+    body = put(body, "industry", str(get(rec, "industry", "")));
+    body = put(body, "uscc", str(get(rec, "uscc", "")));
+  }
+  let st = "completed";
+  if (str(get(r, "status", "")) == "invalid") { st = "failed"; }
+  else if (str(get(r, "status", "")) == "unresolved") { st = "input-required"; }
+  return { state: st, artifacts: [artifact(stringify(body))],
+           note: str(get(r, "status", "")) };
+}
+
+
+// ── 给 node.lume 的两个小接口 ────────────────────────────────────────
+
+// 带「告诉客户端需要什么」的流转(input-required 专用)。
+//
+// 为什么单独一个函数: A2A 里 status.message 与 artifacts 是**两回事** ——
+//   artifacts      = 已经产出的内容
+//   status.message = 当前状态要说的话(通常是 agent 在提问)
+// 把提问塞进 artifacts 会让客户端以为"任务已经有结果了", 于是不再追问。
+export func advance_with_message(id: string, state: string, text: string) {
+  let t = advance(id, state, [], "-> " + state);
+  if (t == null) { return null; }
+  let st = get(t, "status", {});
+  st = put(st, "message", message("agent", text));
+  let t2 = put(t, "status", st);
+  t2 = put(t2, "updated", int(now()));
+  save(t2);
+  return t2;
+}
+
+export func max_hops(): int { return MAX_HOPS; }
+
+// ── 多轮续发所需的三个小工具 ─────────────────────────────────────────
+
+// 把本轮参数记进任务。input-required 之后客户端只补缺的那几个, 所以
+// 必须留着上一轮的, 否则第二轮会把已有参数丢掉 —— 表现是"补了还是说缺",
+// 用户会反复补同一项。
+export func remember_args(id: string, args) {
+  let t = load(id);
+  if (t == null) { return null; }
+  let md = get(t, "metadata", {});
+  md = put(md, "args", args);
+  t = put(t, "metadata", md);
+  save(t);
+  return t;
+}
+
+// 取任务里记住的参数
+export func stored_args(id: string) {
+  let t = load(id);
+  if (t == null) { return {}; }
+  let a = get(get(t, "metadata", {}), "args", {});
+  if (a == null) { return {}; }
+  return a;
+}
+
+// 合并参数: 原有作底, 本轮覆盖。空串不覆盖已有值 ——
+// 客户端续发时常常只填一个字段, 其余传空。
+export func merged_args(id: string, incoming) {
+  let base = stored_args(id);
+  if (incoming == null) { return base; }
+  let ks = keys(incoming);
+  let i = 0;
+  while (i < len(ks)) {
+    let k = str(get(ks, i, ""));
+    let v = get(incoming, k, "");
+    if (len(str(v)) > 0) { base = put(base, k, v); }
+    i = i + 1;
+  }
+  return base;
+}
+
+// 存长任务派活信息。worker 读 metadata.payload 执行。
+export func store_payload(id: string, job) {
+  let t = load(id);
+  if (t == null) { return null; }
+  let md = get(t, "metadata", {});
+  if (job != null) { md = put(md, "payload", job); }
+  t = put(t, "metadata", md);
+  save(t);
+  return t;
+}
+
+// 追加一条用户消息到 history。多轮的可追溯性全靠它。
+export func append_user_message(id: string, text: string) {
+  let t = load(id);
+  if (t == null) { return null; }
+  let h = get(t, "history", []);
+  push(h, message("user", text));
+  t = put(t, "history", h);
+  t = put(t, "updated", int(now()));
+  save(t);
+  return t;
+}

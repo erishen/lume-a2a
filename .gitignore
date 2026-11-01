@@ -1,0 +1,58 @@
+# 运行时数据(任务是按节点分开的, 不应入库)
+.data/
+
+# 容器挂载的数据目录: 实体索引、任务、LLM 协商快照。
+# 这些是本机运行态, 不是源码 —— 尤其 llm-negotiation.json 含模型结论,
+# 提交上去会变成"看起来像项目产出、其实是某一次运行结果"的误导性文件。
+data/
+
+# 本机配置(PEER_SHARED 等凭据)
+.env
+
+# 前端依赖(软链到 ../lume/frontend/node_modules)
+node_modules
+
+# 构建产物由 `make build` 生成, 与源码同源; 但 www/index.html 是手写的,
+# 必须提交 —— 它在 docroot 根上, 少了它整个控制台 404。
+# www/app.js
+# www/app.css
+
+.DS_Store
+
+# ── 开发期临时文件 ──────────────────────────────────────────────────
+# 调试探针(_probe*.lume 等)是一次性验证脚本, 没有复用价值;
+# 留在仓库里会让"哪个是正式代码"变模糊。
+_*.lume
+_probe*.lume
+
+# Dockerfile 的历史备份。回滚用 git 就够了, 不需要第二份副本 ——
+# 两份同构配置必然分叉, 这是本项目已经在 peer.lume 上踩过的坑。
+*.bak-*
+
+# .runtime/: 临时产物(日志、调试输出、旧备份)。
+# 以前 Dockerfile 从这里 COPY lume-core/lib 进镜像, 所以曾需要保留一份;
+# 现在 lib 按版本从 github release 取, 这一份已无用途。
+.runtime/
+
+# 宿主预下载的 lume 静态包(2MB 二进制)。由 make 目标按需下载,
+# 不入库: 二进制进 git 会让仓库每次升级都膨胀, 且无法 code review。
+lume-linux-*.tar.gz
+lume-linux-*.sha
+vendor/*.tar.gz
+
+# 开原前检查/调试的一次性输出
+_leak_test.txt
+*.txt.tmp
+
+# 调试期的一次性输出与代码分片(dispatch_*.part 是拼接前的片段)
+node_*.txt
+*_route*.txt
+src/*.part
+
+# 已由 src/agent.lume + 框架原生 ReAct 取代的 Python 实现。
+# 留在这里会让人以为还有用 —— 而 make 里已无任何目标调用它们。
+scripts/agent_chat.py
+scripts/agent_server.py
+
+# 已退役的 launchd 配置(服务不再需要, agent 由 lume 框架驱动)
+deploy/com.erishen.lume-a2a-agent.plist

@@ -1,0 +1,149 @@
+// src/entity.lume — 实体对齐层: 把「客户公司」和「上市公司」认成同一个对象
+//
+// ══ 为什么需要这一层 ═════════════════════════════════════════════════
+// 现在的推荐链路是: 客户 → 公司名关键词猜行业 → 行业 → 股票。
+// 猜字是它唯一能用的原因, 也是它最大的问题:
+//   "中科能源科技" 同时含 科技 和 能源, 规则顺序一改, 归类就变了;
+//   "江南食品集团" 究竟是不是某家上市公司, 靠字符串永远说不清。
+//
+// Ontology 里最贵的那一半就是这里: **实体解析**(entity resolution)。
+// 做对了, 后面才有"关系"; 做不对, 关系全是错的, 而且错得很安静。
+//
+// ══ 本层的三条规则 ═══════════════════════════════════════════════════
+// 1. **主键是统一社会信用代码(USCC), 不是名字。**
+//    名字会重名、会改、简称全称不一致; USCC 18 位, 全国唯一且稳定。
+//    A 股上市公司另有一个稳定标识: 股票代码(6 位)。两者都需要,
+//    因为 CRM 里记的是工商主体, 行情里记的是证券。
+//
+// 2. **没有 USCC 就不认。**
+//    不做"名字像就算同一个"的模糊匹配。理由: 错配的代价不对称 ——
+//    漏配只是少一条推荐, 错配会把 A 公司的商机挂到 B 公司的股票上,
+//    而使用者不会去核对, 只会觉得"推荐不准但能用"。这类错误最难发现。
+//
+// 3. **匹配结果要能解释。**
+//    每条对齐都带 method 与 evidence, 说得清是"按 USCC 精确命中"
+//    还是"人工指定"。将来出了问题能追到原因, 而不是只有一个 true。
+//
+// ══ 现状(必须知道) ═══════════════════════════════════════════════════
+// crm 与 scanner 两边**都没有 USCC**:
+//   crm.customers      = id/name/company/email/phone(没有工商标识)
+//   asset_snapshot     = code/name/close/pe/pb(没有工商标识, 也没有行业)
+// 所以本层现在只能:
+//   * 用人工维护的「代码 → 美国存托/工商主体」对照表(见 identity_map);
+//   * 对没有对照的实体如实返回 unresolved, 并说明缺什么。
+// 这不是缺陷, 是当前数据的真实状态 —— 把这一点藏起来才是缺陷。
+
+// ── USCC 校验 ───────────────────────────────────────────────────────
+// 18 位, GB 32100-2015。校验位算法: 前 17 位加权求和 mod 31, 查表得第 18 位。
+// 为什么要真校验: 系统里最常见的脏数据不是"没有代码", 而是"填错一位的代码"。
+// 不校验就会把它当成真标识存下来, 后果比空值更糟 —— 空值至少看起来是缺。
+let USCC_CHARS = "0123456789ABCDEFGHJKLMNPQRTUWXY";
+let USCC_WEIGHTS = [1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28];
+
+func uscc_index(ch: string): int {
+  if (len(ch) != 1) { return -1; }
+  let i = 0;
+  while (i < len(USCC_CHARS)) {
+    if (substr(USCC_CHARS, i, 1) == ch) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// 合法返回 true。空串也返回 false —— 调用方据此区分"有代码且正确"与其它。
+export func uscc_valid(code: string): bool {
+  let c = upper(trim(str(code)));
+  if (len(c) != 18) { return false; }
+  // 全同字符(000000000000000000、AAAAAAAAAAAAAAAAAA)在算法上是"合法"的 ——
+  // 校验位恰好能对上。这类值是占位符/脏数据, 必须单独拦掉:
+  // 算法校验只能证明"没写错", 不能证明"是真的"。
+  let first = substr(c, 0, 1);
+  let all_same = true;
+  let k = 1;
+  while (k < 18) {
+    if (substr(c, k, 1) != first) { all_same = false; }
+    k = k + 1;
+  }
+  if (all_same) { return false; }
+  let sum = 0;
+  let i = 0;
+  while (i < 17) {
+    let idx = uscc_index(substr(c, i, 1));
+    if (idx < 0) { return false; }
+    sum = sum + idx * int(get(USCC_WEIGHTS, i, 0));
+    i = i + 1;
+  }
+  // GB 32100: 校验位 = 31 - (sum mod 31); 结果为 31 时取 0
+  let rem = 31 - (sum % 31);
+  if (rem == 31) { rem = 0; }
+  return substr(c, 17, 1) == substr(USCC_CHARS, rem, 1);
+}
+
+// ── 股票代码规范化 ──────────────────────────────────────────────────
+// 输入可能是 600519 / sh600519 / SH600519 / 600519.SH, 统一成 sh600519。
+// 为什么要统一: crm 与 scanner 各自的写法不同, 不归一化就永远对不上,
+// 而失败表现只是"没匹配到", 看不出是格式问题。
+export func norm_code(raw: string): string {
+  let s = lower(trim(str(raw)));
+  // 去交易所后缀: 600519.sh → 600519
+  let dot = str_match("^([0-9]{6})\\.[a-z]{2}$", s);
+  if (dot != null and len(dot) > 0) {
+    s = substr(s, 0, 6);
+  }
+  // 已有前缀
+  let pre = str_match("^(sh|sz|bj)([0-9]{6})$", s);
+  if (pre != null and len(pre) > 0) {
+    let g = get(get(pre, 0, {}), "groups", []);
+    return str(get(g, 0, "")) + str(get(g, 1, ""));
+  }
+  // 裸 6 位: 按首位判断交易所。6/9=沪, 0/2/3=深, 4/8=北
+  let bare = str_match("^([0-9]{6})$", s);
+  if (bare != null and len(bare) > 0) {
+    let first = substr(s, 0, 1);
+    if (first == "6" or first == "9") { return "sh" + s; }
+    if (first == "0" or first == "2" or first == "3") { return "sz" + s; }
+    if (first == "4" or first == "8") { return "bj" + s; }
+    return "sh" + s;
+  }
+  return s;
+}
+
+// ── 对齐结果 ────────────────────────────────────────────────────────
+// status:
+//   matched     有 USCC 且校验通过, 且能定位到证券代码
+//   unresolved  缺标识(没有 USCC, 或该工商主体未上市/未收录)
+//   invalid     填了 USCC 但校验不过 —— 这是脏数据, 必须单独报出来
+//
+// 把 invalid 和 unresolved 分开: 前者要去修数据, 后者要去补数据。
+// 合成一个"未匹配"会让人以为只是没找到。
+export func align(company_name: string, uscc: string, code: string) {
+  let name = trim(str(company_name));
+  let u = str(uscc);
+  let c = norm_code(code);
+
+  if (len(name) == 0) {
+    return { status: "invalid", name: name, uscc: u, code: c,
+             method: "", evidence: "", reason: "公司名称为空, 无法建立实体" };
+  }
+  if (len(u) > 0 and not uscc_valid(u)) {
+    return { status: "invalid", name: name, uscc: u, code: c,
+             method: "uscc-check", evidence: u,
+             reason: "USCC 校验位不通过(18 位 GB32100 算法), 疑似录入错误" };
+  }
+  if (len(c) > 0) {
+    // 有证券代码 = 已上市, 可以直接建立双向链接
+    return { status: "matched", name: name, uscc: u, code: c,
+             method: len(u) > 0 ? "uscc+code" : "code",
+             evidence: len(u) > 0 ? "USCC 合法且给出证券代码" : "直接给出证券代码",
+             reason: "" };
+  }
+  if (len(u) > 0) {
+    return { status: "unresolved", name: name, uscc: u, code: "",
+             method: "uscc", evidence: u,
+             reason: "USCC 合法但未关联证券代码(非上市公司或未收录)" };
+  }
+  // 只有名字: 明确拒绝做模糊匹配, 并说清缺什么
+  return { status: "unresolved", name: name, uscc: "", code: "",
+           method: "none", evidence: "",
+           reason: "缺少 USCC 与证券代码; 本层不做名称模糊匹配(错配代价高于漏配)" };
+}

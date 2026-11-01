@@ -1,0 +1,115 @@
+// src/catalog.lume — 本节点对外声明的能力(单一事实源)
+//
+// ══ 收敛后的原则 ═══════════════════════════════════════════════════
+// 只声明**真实存在、且不含荐股语义**的能力。
+//
+// 之前这里有 7 个演示能力: echo.roundtrip / facts.aggregate / relay.forward /
+// plan.split / report.compose / batch.process —— 它们是为了让协议跑通造的,
+// 没有任何业务含义。留着会让读者误判项目重心, 也让 Agent Card 对外撒谎:
+// 声称有能力, 实际只是回显。
+//
+// 现在四项, 都是这个节点真做的事:
+//   sector.movement   行业级动向(聚合, 不下探个股)
+//   customer.reach    本节点已知的行业客户覆盖(转 crm)
+//   entity.resolve    按 USCC/证券代码解析实体
+//   node.capabilities 自检: 我现在能做什么
+//
+// ⚠️ 边界: 没有任何能力返回个股买卖方向。这是刻意的, 见 README「产品定位」。
+//
+// 这与三处消费方共用: /api/capabilities、Agent Card 的 skills、dispatch()。
+let CAPS = [
+  {
+    "name": "sector.movement",
+    "title": "行业级动向",
+    "desc": "按行业聚合当日行情: 涨跌家数、平均涨跌幅、样本大小。" +
+            "**只到行业, 不返回任何证券代码**。用于判断'哪个行业今天不平静', " +
+            "不用于判断'该买什么'。",
+    "args": [{ "k": "industry", "label": "行业名(留空则返回全部)", "required": false, "sample": "" }],
+    "latency_ms": 300,
+    "kind": "query",
+  },
+  {
+    "name": "customer.reach",
+    "title": "行业客户覆盖",
+    "desc": "某个行业当前有多少客户在跟进。数据来自 crm 节点的行业聚合 —— " +
+            "**只有计数, 不含姓名/邮箱/电话**。用于判断'这个行业动向能落到几个客户'。",
+    "args": [{ "k": "industry", "label": "行业名", "required": true, "sample": "食品饮料" }],
+    "latency_ms": 200,
+    "kind": "query",
+  },
+  {
+    "name": "entity.resolve",
+    "title": "实体解析",
+    "desc": "按统一社会信用代码(USCC)、证券代码或已登记别名, 解析出对应的工商主体。" +
+            "未登记的名称**不做模糊匹配**(错配代价高于漏配), 如实返回 unresolved。",
+    "args": [
+      { "k": "uscc", "label": "统一社会信用代码", "required": false, "sample": "91511500MA62A0WM8P" },
+      { "k": "code", "label": "证券代码", "required": false, "sample": "sh600519" },
+      { "k": "name", "label": "公司名/别名", "required": false, "sample": "贵州茅台" },
+    ],
+    "latency_ms": 50,
+    "kind": "query",
+  },
+  {
+    "name": "node.capabilities",
+    "title": "本节点能力自检",
+    "desc": "返回本节点的身份、签名模式、当前可用能力与实体索引覆盖情况。" +
+            "用于对端在调用前确认'你是谁、能做什么、数据基础如何'。",
+    "args": [],
+    "latency_ms": 60,
+    "kind": "query",
+  },
+];
+
+export func all() { return CAPS; }
+
+export func get_cap(name: string) {
+  let i = 0;
+  while (i < len(CAPS)) {
+    let c = get(CAPS, i, {});
+    if (str(get(c, "name", "")) == name) { return c; }
+    i = i + 1;
+  }
+  return null;
+}
+
+// 转成 A2A Agent Card 的 skills[]。A2A 要求 id / name / description / tags 齐全。
+export func as_skills() {
+  let out = [];
+  let i = 0;
+  while (i < len(CAPS)) {
+    let c = get(CAPS, i, {});
+    let nm = str(get(c, "name", ""));
+    let dot = str_match("^([A-Za-z0-9_-]+)\\.", nm);
+    let tag = "general";
+    if (dot != null and len(dot) > 0) {
+      tag = str(get(get(get(dot, 0, {}), "groups", []), 0, "general"));
+    }
+    push(out, {
+      id: nm,
+      name: str(get(c, "title", nm)),
+      description: str(get(c, "desc", "")),
+      tags: [tag],
+      examples: [args_example(c)],
+    });
+    i = i + 1;
+  }
+  return out;
+}
+
+func args_example(c) {
+  let args = get(c, "args", []);
+  let parts = [];
+  let i = 0;
+  while (i < len(args)) {
+    let a = get(args, i, {});
+    let s = str(get(a, "sample", ""));
+    if (len(s) > 0) { push(parts, str(get(a, "k", "")) + "=" + s); }
+    i = i + 1;
+  }
+  let ex = str(get(c, "name", ""));
+  if (len(parts) > 0) { ex = ex + " " + join(parts, " "); }
+  return ex;
+}
+
+export func count(): int { return len(CAPS); }

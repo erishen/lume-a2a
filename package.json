@@ -1,0 +1,24 @@
+{
+  "name": "lume-a2a-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Lume A2A peer-to-peer demo console: React + TypeScript, bundled by esbuild into www/ for the Lume docroot. The server side is node.lume (Lume + lume-core/lib/peer.lume).",
+  "scripts": {
+    "build:js": "esbuild src/ui/main.tsx --bundle --minify --format=esm --jsx=automatic --outfile=www/app.js",
+    "build:css": "esbuild src/ui/app.css --minify --outfile=www/app.css",
+    "build": "npm run build:js && npm run build:css",
+    "dev": "esbuild src/ui/main.tsx --bundle --format=esm --jsx=automatic --outfile=www/app.js --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "license": "MIT"
+}

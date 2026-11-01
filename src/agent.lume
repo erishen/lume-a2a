@@ -1,0 +1,110 @@
+// src/agent.lume — 「问一句, 它自己去查」的工具层(纯 lume, 无 Python)
+//
+// ══ 为什么在 lume 里, 而不是一个小 Python 服务 ═══════════════════════
+// 这里原先有一个 scripts/agent_chat.py: 手写 ReAct 循环(最多 4 轮)、
+// 工具表、JSON 协议、HMAC 签名。而 lume 框架**本来就自带这些**:
+//
+//   工具注册   tool "name", "desc", {schema}, (arg) => {...}   ← 本文件只用这一条
+//   ReAct 循环 agent.c:762  for (round = 1..8)                 ← 框架驱动
+//   HMAC 签名  hmac_sha256(key, msg)  内建(interp.c:1452)      ← 已在 peer.lume 里用
+//   模型调用   fork + exec curl       agent.c:3               ← 框架负责
+//
+// 也就是说: 那份 Python 是在框架已有能力之上**又实现了一遍**循环。
+// 删掉之后镜像不用装 python3(121MB 不变), 也少了一个"没起就报错"的进程。
+//
+// ══ 分工: 框架管循环, 本文件只管"能查什么" ═════════════════════════
+// 框架把用户问题 + 已注册工具的 schema 交给模型, 模型决定调谁、参数是什么,
+// 框架执行并回填结果, 直到模型给答案(或到轮数上限)。本文件不碰循环。
+//
+// 每个工具都走 fleet.invoke() —— 那是**跨节点调用的唯一入口**, 签名、
+// 注册表校验、trace 埋点都在里面。工具层另开一条 HTTP 通道的话, Agent 页
+// 的流水就会缺这几笔, 而"看不见的调用"正是这个项目要避免的。
+import "fleet.lume" as fleet;
+
+// ── 工具清单 ──────────────────────────────────────────────────────────
+// 故意只给这几项, 不做"任意调用":
+// 模型能调的东西越少, 它越不容易去调一个不该调的 —— 而调错的代价是
+// 一顿白跑 + 一段编出来的回答。每个 desc 都写明"回答什么问题时用",
+// 让选择依据是用途而不是名字。
+
+// crm.stats: 客户数与商机总额。回答"一共多少客户/多少管道"。
+export func crm_stats() {
+  return fleet.invoke("crm", "crm.stats", 20);
+}
+
+// crm.industries: 客户按行业分布。回答"哪些行业有客户"。
+export func crm_industries() {
+  return fleet.invoke("crm", "crm.industries", 20);
+}
+
+// crm.stages: 行业 × 商机阶段。回答"哪个行业推进得最靠前"。
+export func crm_stages() {
+  return fleet.invoke("crm", "crm.stages", 20);
+}
+
+// scanner.picks: 当日选股清单(含信号强度)。回答"今天哪些标的在放信号"。
+export func scanner_picks() {
+  return fleet.invoke("scanner", "scanner.picks", 20);
+}
+
+// scanner.meta: 行情新鲜度(最新交易日/覆盖股票数)。回答"数据到哪天了"。
+export func scanner_meta() {
+  return fleet.invoke("scanner", "scanner.meta", 20);
+}
+
+// ── 注册 ──────────────────────────────────────────────────────────────
+// 必须在 route / tool 语句**之前**定义被引用的函数(lume 顶层按声明顺序求值),
+// 所以上面先写好, 这里再注册。
+//
+// ⚠️ **工具名不能用点号**。节点侧的能力名是 `crm.stats`, 但这里必须写成
+// `crm_stats`: OpenAI 兼容接口要求 function.name 匹配 `^[a-zA-Z0-9_-]+$`,
+// 带点号会被上游直接回 400 Invalid 'tools[0].function.name'。
+// 这个错误在本地看不出来(工具注册成功、tools() 里也有), 只有真发出去才炸,
+// 而且报错文案是 "upstream rejected (HTTP 400)", 指不到"名字里有个点"。
+// 节点名与能力名在 desc 里说清楚, 模型不需要靠名字猜来源。
+//
+// 每个 handler 只返回 `{ ok, result, error }`: 框架把它序列化回填给模型。
+// 返回里**不要**塞人看的措辞 —— 模型读的是数据, 措辞由它自己组织;
+// 我们硬塞一句"这是一个好机会"反而会被它当成数据抄进答案。
+//
+// params 是空 map: 这些工具都不带参数。带参数的版本要慎重 ——
+// 一旦模型可以传任意行业名, 它就会开始猜名字, 而"猜"正是这个 Agent
+// 明确承诺不做的事(见 prompts/agent_crm.md)。
+tool "crm_stats", "客户数与商机总额、成交率的聚合。回答'一共多少客户/多少管道'时用。",
+     {}, (arg) => { return crm_stats(); };
+
+tool "crm_industries", "客户按行业的人数分布。回答'哪些行业有客户'时用。",
+     {}, (arg) => { return crm_industries(); };
+
+tool "crm_stages", "按行业 × 商机阶段的分布(哪个行业有客户进入谈判)。回答'哪个行业客户推进得最靠前'时用。",
+     {}, (arg) => { return crm_stages(); };
+
+tool "scanner_picks", "当日扫描选出的标的清单(含信号强度)。回答'今天有哪些标的在放信号'时用。",
+     {}, (arg) => { return scanner_picks(); };
+
+tool "scanner_meta", "行情数据的新鲜度(最新交易日、覆盖股票数)。回答'数据到哪天了'时用。",
+     {}, (arg) => { return scanner_meta(); };
+
+// ── 自检 ──────────────────────────────────────────────────────────────
+// 注册是有副作用的(框架侧多一个工具), 而"工具全没注册上"的表现是
+// 模型一本正经地回答"我没有可用的工具" —— 看起来像模型不配合,
+// 实际是配置问题。所以启动时确认一次。
+export func registered() {
+  let all = tools();
+  let need = ["crm_stats", "crm_industries", "crm_stages",
+              "scanner_picks", "scanner_meta"];
+  let miss = [];
+  let i = 0;
+  while (i < len(need)) {
+    let nm = str(get(need, i, ""));
+    let j = 0;
+    let hit = false;
+    while (j < len(all)) {
+      if (str(get(all, j, "")) == nm) { hit = true; }
+      j = j + 1;
+    }
+    if (!hit) { push(miss, nm); }
+    i = i + 1;
+  }
+  return { ok: len(miss) == 0, total: len(all), missing: miss };
+}

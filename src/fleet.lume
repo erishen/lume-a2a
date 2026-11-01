@@ -1,0 +1,201 @@
+// src/fleet.lume — 接入真实的 peer 节点(crm / scanner)
+//
+// 为什么换成真实节点: 自造的 echo / aggregate 只能证明"能发 HTTP", 证明不了
+// A2A 有用。接上 crm(客户/商机) 与 scanner(行情信号/选股) 之后, 跨节点调用
+// 拿到的是**真实业务数据**, 而且这两个项目都公开可查 —— 别人可以照着复现。
+//
+// ── 认证 ────────────────────────────────────────────────────────────
+// 两个真实节点跑的是**按节点派生密钥**模式:
+//     key(node) = hmac_sha256(PEER_ROOT, "peer:" + node)
+// 所以我们只用 PEER_ROOT + PEER_NAME, 由 lib/peer.lume 自动走 derived 模式。
+//
+// 踩过的坑: 配共享密钥(PEER_SHARED)时签名**算得出来但是错的**, 对端一律回
+// "bad signature" —— 报错完全指不到"模式不匹配"。必须同一个 PEER_ROOT。
+//
+// ── 注册 ────────────────────────────────────────────────────────────
+// 光有正确密钥还不够: 对端注册表里没有 lume-a2a 时会回
+//     unknown peer 'lume-a2a' (not in registry)
+// 这是身份可信层在起作用(防止拿自己的密钥冒充别人), 不是 bug。
+// 所以两侧的 .data/peers-identity.json 需要登记本节点 —— 见 README「接入真实节点」。
+import "../../lume-core/lib/peer.lume" as peer;
+import "trace.lume" as trace;
+import "entity.lume" as ent;
+
+// 节点表。地址由环境变量给, 默认值就是本机 make dev 起的两个 peer 进程。
+// 用 PEER_FLEET 覆盖, 格式 "name=host:port,name=host:port"。
+let default_fleet = "crm=127.0.0.1:18102,scanner=127.0.0.1:18103";
+
+func fleet_spec(): string {
+  let v = env("PEER_FLEET");
+  if (v == null or len(str(v)) == 0) { return default_fleet; }
+  return str(v);
+}
+
+// 解析成 [{name, host}]。跳过空项与缺 "=" 的项 —— 宁可少一个节点,
+// 不要因为一处笔误整个列表解析失败。
+export func nodes() {
+  let out = [];
+  let parts = split(fleet_spec(), ",");
+  let i = 0;
+  while (i < len(parts)) {
+    let p = trim(str(get(parts, i, "")));
+    if (len(p) > 0) {
+      let kv = split(p, "=");
+      let nm = str(get(kv, 0, ""));
+      let host = str(get(kv, 1, ""));
+      if (len(nm) > 0 and len(host) > 0) {
+        push(out, { name: nm, host: host });
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 探测一个节点: 健康 + 能力清单 + Agent Card。
+// 三个请求任一失败就整体标 offline, 但**保留已完成的部分** —— 比如健康
+// 通了但 tools 超时, 前端仍能显示"在线, 但拿不到能力", 而不是一片空白。
+export func probe(node) {
+  let nm = str(get(node, "name", ""));
+  let host = str(get(node, "host", ""));
+  let t0 = int(now());
+  let h = peer.get_peer(host, "/peer/health", 5);
+  let health = get(h, "json", null);
+  let t1 = int(now());
+  let out = {
+    name: nm,
+    host: host,
+    online: get(h, "ok", false) == true and get(health, "ok", false) == true,
+    latency_ms: (t1 - t0) * 1000,
+    error: "",
+    mode: "",
+    site: "",
+    tools: [],
+    summary: "",
+  };
+  if (!get(out, "online", false)) {
+    // 错误分类: 401(密钥/注册) 与 连不上 是两种完全不同的故障, 混在一起
+    // 排障时会先怀疑网络, 实际是注册表少了一行。
+    let j = get(h, "json", null);
+    let err = str(get(h, "err", ""));
+    if (j != null and get(j, "unauthorized", false) == true) {
+      out = put(out, "error", "认证被拒: " + str(get(j, "error", "")));
+    } else if (len(err) > 0) {
+      out = put(out, "error", "连不上: " + err);
+    } else {
+      out = put(out, "error", "健康检查失败(status=" + str(get(h, "status", 0)) + ")");
+    }
+    return out;
+  }
+  out = put(out, "mode", str(get(health, "mode", "")));
+  out = put(out, "site", str(get(health, "site", "")));
+  let t = peer.get_peer(host, "/peer/tools", 5);
+  let tj = get(t, "json", null);
+  if (tj != null) {
+    out = put(out, "tools", get(tj, "tools", []));
+    out = put(out, "summary", str(get(tj, "summary", "")));
+  }
+  return out;
+}
+
+// 探测全部节点
+export func probe_all() {
+  let ns = nodes();
+  let out = [];
+  let i = 0;
+  while (i < len(ns)) {
+    push(out, probe(get(ns, i, {})));
+    i = i + 1;
+  }
+  return out;
+}
+
+// 按名字找节点地址(给工具调用用)
+export func host_of(name: string): string {
+  let ns = nodes();
+  let i = 0;
+  while (i < len(ns)) {
+    let n = get(ns, i, {});
+    if (str(get(n, "name", "")) == name) { return str(get(n, "host", "")); }
+    i = i + 1;
+  }
+  return "";
+}
+
+// 在某个节点上执行一个它声明的工具。
+//
+// 为什么目标节点与工具名分开传: 工具名里已经带域前缀(crm.stats / scanner.picks),
+// 但**不能靠前缀推目标** —— 那等于把命名约定变成了路由规则, 改个名字就断。
+// 参数名不能用 node / tool: 都是保留字, 在参数位会被拒
+// (--check 报 "expected parameter name")。lib/peer.lume 文件头第 8 条记过。
+export func invoke(target: string, cap_id: string, timeout: int) {
+  // 这是**所有跨节点调用的唯一入口**, 所以埋点放这里一处就够 ——
+  // 散在各调用点的话, 迟早漏掉一处, 而漏掉的那处正好是出问题的那条链路。
+  let t0 = int(now());
+  let host = host_of(target);
+  if (len(host) == 0) {
+    trace.record(self_name(), target, cap_id, 0, false, "unknown node", 0, "");
+    return { ok: false, error: "未知节点 '" + target + "'(检查 PEER_FLEET)", node: target };
+  }
+  let body = stringify({ "tool": cap_id, "arguments": {} });
+  let r = peer.post_peer(host, "/peer/invoke", body, timeout);
+  let ms = (int(now()) - t0) * 1000;
+  let size = len(str(get(r, "body", "")));
+  if (!get(r, "ok", false)) {
+    trace.record(self_name(), target, cap_id, ms, false,
+                 str(get(r, "err", "unreachable")), size, "transport");
+    return { ok: false, error: str(get(r, "err", "unreachable")), node: target,
+             status: int(get(r, "status", 0)) };
+  }
+  let j = get(r, "json", null);
+  if (j == null) {
+    trace.record(self_name(), target, cap_id, ms, false, "bad json", size, "parse");
+    return { ok: false, error: "对端返回的不是合法 JSON", node: target };
+  }
+  if (get(j, "ok", false) != true) {
+    trace.record(self_name(), target, cap_id, ms, false,
+                 str(get(j, "error", "execution failed")), size, "rejected");
+    return { ok: false, error: str(get(j, "error", "execution failed")), node: target };
+  }
+  // 成功时带一句"拿到了什么": 行数/节点数等, 让人知道这次调用有没有实际产出。
+  trace.record(self_name(), target, cap_id, ms, true, "", size, shape_note(get(j, "result", null)));
+  return { ok: true, error: "", node: target, result: get(j, "result", null) };
+}
+
+// 本节点名。单独抽出来是因为 trace 需要"调用方是谁",
+// 而 fleet 不该反向依赖 a2a(会成环)。
+func self_name() {
+  let n = env("PEER_NAME");
+  if (n == null) { return "lume-a2a"; }
+  return str(n);
+}
+
+// 给结果一个简短形状描述。不同能力的返回结构不同, 硬套一个模板会误导,
+// 所以按常见形态给几种, 认不出就留空 —— 不猜。
+func shape_note(res) {
+  if (res == null) { return ""; }
+  let rows = get(res, "rows", null);
+  if (rows != null) { return str(len(rows)) + " 行"; }
+  let inds = get(res, "industries", null);
+  if (inds != null) { return str(len(inds)) + " 个行业"; }
+  let picks = get(res, "picks", null);
+  if (picks != null) { return str(len(picks)) + " 只候选"; }
+  let cust = get(res, "customer_count", null);
+  if (cust != null) { return str(cust) + " 个客户"; }
+  return "";
+}
+
+// 按名字探测单个节点。probe() 收的是 {name, host} 结构, 直接传名字会炸
+// (get(string, "name") → "get() expects a map or list")。这里做一次查找。
+export func probe_named(name: string) {
+  let ns = nodes();
+  let i = 0;
+  while (i < len(ns)) {
+    let n = get(ns, i, {});
+    if (str(get(n, "name", "")) == name) { return probe(n); }
+    i = i + 1;
+  }
+  return { name: name, host: "", online: false,
+           error: "未知节点 '" + name + "'(检查 PEER_FLEET)", latency_ms: 0,
+           mode: "", site: "", tools: [], summary: "" };
+}

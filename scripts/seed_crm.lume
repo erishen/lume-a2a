@@ -1,0 +1,192 @@
+// seed_crm.lume — 给 CRM 补几条客户, 让「客户行业 × 当日信号」有交集可看
+//
+// ══ 为什么需要这个脚本 ═══════════════════════════════════════════════════
+// CRM 原有客户只有「蓝湾科技(信息技术)」「山海资本(金融)」, 而 scanner 当日
+// 选出的 8 只标的全在食品饮料/汽车/电力设备/钢铁/交通运输/房地产等行业。
+// 两边没有交集, 「推广」场景就只能显示「今日无信号」——功能是对的, 但看不出
+// 它在解决问题。
+//
+// 所以补 6 个客户, 每个覆盖一个当日有信号的行业。公司名刻意选得能命中
+// lume-a2a 的行业关键词规则(见 src/industry.lume 的 COMPANY_RULES),
+// 否则会被归为"未归类", 等于白加。
+//
+// ══ 前置条件(重要) ═══════════════════════════════════════════════════════
+// CRM 默认跑在**只读演示模式**(LUME_CRM_READONLY=1), 所有写路由返回 403。
+// 这是有意的保护, 不是故障。要写数据必须先以可写模式启动:
+//
+//     cd ../lume-crm
+//     LUME_CRM_READONLY= docker compose up -d crm
+//
+// 跑完之后建议改回只读:
+//
+//     docker compose up -d crm          # 恢复 compose 里的默认值(只读)
+//
+// ══ 用法 ═════════════════════════════════════════════════════════════════
+//     lume scripts/seed_crm.lume                        # 默认 127.0.0.1:11080
+//     lume scripts/seed_crm.lume 127.0.0.1:11090
+//
+// 幂等: 已存在同名公司则跳过, 重复跑不会造出一堆重复客户。
+//
+// 迁移自 seed_crm.py。逻辑一一对应, 只把 urllib 换成 http_*, json 换成内建。
+
+// (姓名, 公司, 邮箱, 电话, 商机标题, 金额)
+// 邮箱统一用 .example 域名: RFC 2606 保留域名, 永远不可能是真实邮箱。
+let seeds = [
+  { name: "周晓峰", company: "江南食品集团", email: "zhouxf@jnfood.example",
+    phone: "13900001001", title: "区域渠道年度采购", amount: 68000 },
+  { name: "李维", company: "北辰汽车零部件", email: "liwei@bcaauto.example",
+    phone: "13900001002", title: "整车厂配套订单", amount: 152000 },
+  { name: "王振", company: "中科能源科技", email: "wangz@zkenergy.example",
+    phone: "13900001003", title: "储能项目一期", amount: 240000 },
+  { name: "赵敏", company: "宏远钢铁贸易", email: "zhaom@hysteel.example",
+    phone: "13900001004", title: "钢材年度框架协议", amount: 96000 },
+  { name: "孙立", company: "东联物流", email: "sunli@dl-logistics.example",
+    phone: "13900001005", title: "干线运输服务", amount: 73000 },
+  { name: "陈芳", company: "瑞和置业", email: "chenf@ruihe.example",
+    phone: "13900001006", title: "写字楼租赁", amount: 58000 },
+];
+
+let base = "http://127.0.0.1:11080";
+let args0 = argv();
+if (len(args0) > 0 and len(str(get(args0, 0, ""))) > 0) {
+  let a = str(get(args0, 0, ""));
+  // 允许传 "127.0.0.1:11080" 或完整 URL —— 直接调用时人不会想这些。
+  if (substr(a, 0, 4) == "http") { base = a; } else { base = "http://" + a; }
+}
+
+// 调一个接口。body 为空 = GET。
+// 返回 { status, json } —— 失败也返回, 不抛: 脚本要能打印出可读的结论。
+func call(path: string, payload) {
+  let url = base + path;
+  let r = {};
+  if (payload == null) {
+    r = http_get(url, { timeout: 10, allow_private: true });
+  } else {
+    r = http_post(url, {
+      timeout: 10, allow_private: true,
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: stringify(payload) });
+  }
+  if (get(r, "ok", false) != true) {
+    return { status: 0, json: { err: str(get(r, "err", "unreachable")) } };
+  }
+  let txt = str(get(r, "body", ""));
+  let j = {};
+  if (len(txt) > 0) {
+    let p = try(() => json(txt));
+    if (p.err == null and p.ok != null) { j = p.ok; }
+  }
+  return { status: int(get(r, "status", 200)), json: j };
+}
+
+
+// 千分位。内建没有格式化数字的函数, 所以自己数: 从右往左三位一断。
+// 只是显示用, 差一位不影响逻辑, 但两版输出不一致会让人怀疑迁移漏了什么。
+func comma(n) {
+  let s = str(int(n));
+  let neg = false;
+  if (len(s) > 0 and substr(s, 0, 1) == "-") { neg = true; s = substr(s, 1, len(s) - 1); }
+  let out = "";
+  let c = 0;
+  let i = len(s) - 1;
+  while (i >= 0) {
+    out = substr(s, i, 1) + out;
+    c = c + 1;
+    if (c % 3 == 0 and i > 0) { out = "," + out; }
+    i = i - 1;
+  }
+  if (neg) { return "-" + out; }
+  return out;
+}
+
+func jsub(m) {
+  if (m == null) { return {}; }
+  return m;
+}
+
+// ── 1) 先确认 CRM 可达 ────────────────────────────────────────────────
+let st = call("/api/stats", null);
+if (int(get(st, "status", 0)) != 200) {
+  print("✗ CRM 不可达: " + base);
+  print("  先起 CRM 或确认端口。默认: 127.0.0.1:11080");
+} else {
+  // ── 2) 现有公司名(用于幂等) ─────────────────────────────────────────
+  let cur = call("/api/customers", null);
+  let have = [];
+  let customers = [];
+  if (int(get(cur, "status", 0)) == 200) {
+    customers = jsub(get(get(cur, "json", {}), "customers", null));
+    if (customers == null) { customers = []; }
+  }
+  let ci = 0;
+  while (ci < len(customers)) {
+    push(have, str(get(get(customers, ci, {}), "company", "")));
+    ci = ci + 1;
+  }
+
+  let added = 0;
+  let skipped = 0;
+  let failed = false;
+
+  let i = 0;
+  while (i < len(seeds) and !failed) {
+    let s = get(seeds, i, {});
+    let company = str(get(s, "company", ""));
+
+    let exists = false;
+    let hj = 0;
+    while (hj < len(have)) {
+      if (str(get(have, hj, "")) == company) { exists = true; }
+      hj = hj + 1;
+    }
+
+    if (exists) {
+      print("  - 跳过(已存在): " + company);
+      skipped = skipped + 1;
+    } else {
+      let rc = call("/api/customers", {
+        name: str(get(s, "name", "")), company: company,
+        email: str(get(s, "email", "")), phone: str(get(s, "phone", "")) });
+
+      if (int(get(rc, "status", 0)) == 403) {
+        print("✗ 写操作被拒: CRM 处于只读模式(LUME_CRM_READONLY=1)");
+        print("  以可写模式重启: cd ../lume-crm && LUME_CRM_READONLY= docker compose up -d crm");
+        failed = true;
+      } else if (int(get(rc, "status", 0)) != 200 and int(get(rc, "status", 0)) != 201) {
+        print("✗ 新增客户失败 " + company + ": " + str(get(rc, "status", 0)) +
+              " " + stringify(get(rc, "json", {})));
+        failed = true;
+      } else {
+        let rj = jsub(get(rc, "json", {}));
+        // id 可能在 customer.id 或顶层 id, 两种都认
+        let cid = get(jsub(get(rj, "customer", {})), "id", get(rj, "id", null));
+        let cid_s = cid == null ? "" : str(cid);
+        print("  + 客户 " + company + " (id=" + cid_s + ")");
+        added = added + 1;
+
+        if (len(cid_s) > 0 and cid_s != "null") {
+          let rd = call("/api/deals", {
+            customer_id: cid, title: str(get(s, "title", "")),
+            stage: "初步接洽", amount: float(get(s, "amount", 0)) });
+          let dst = int(get(rd, "status", 0));
+          if (dst == 200 or dst == 201) {
+            print("    商机: " + str(get(s, "title", "")) + " ¥" + comma(get(s, "amount", 0)));
+          } else {
+            print("    ! 商机创建失败: " + str(dst) + " " + stringify(get(rd, "json", {})));
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+
+  if (!failed) {
+    let fin = call("/api/stats", null);
+    print("\n完成: 新增 " + str(added) + " 个, 跳过 " + str(skipped) + " 个");
+    if (int(get(fin, "status", 0)) == 200) {
+      let fj = jsub(get(fin, "json", {}));
+      print("当前: 客户 " + str(get(fj, "customer_count", 0)) + " 个, " +
+            "开放管道 ¥" + comma(get(fj, "open_pipeline", 0)));
+    }
+  }
+}

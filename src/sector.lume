@@ -1,0 +1,229 @@
+// src/sector.lume — 行业级动向(不是个股推荐)
+//
+// ══ 为什么要有这一层 ═══════════════════════════════════════════════
+// 之前那版做的是"客户行业 × 当日有信号的个股 → 该推哪只票"。
+// 那是荐股, 合规压力大, 而且把问题问错了 ——
+// 销售真正需要知道的往往不是"买什么", 而是**"今天该联系谁、由头是什么"**。
+//
+// 所以这一层只做一件事: 把一个行业里**整体**在发生什么聚合出来。
+//   * 用波动率、动量、涨跌家数做行业级指标;
+//   * 输出的是"这个行业今天异动"这种描述, 不指向任何一只具体标的;
+//   * 由头给的是行业现象, 不是买卖建议。
+//
+// ══ 边界(必须守住) ═════════════════════════════════════════════════
+// 1. 只到行业, 不下探到个股代码。页面与接口都不返回"该买哪只"。
+// 2. 异动 ≠ 机会。描述用"波动放大"/"整体走弱", 不用"值得买入"。
+// 3. 行业归属来自实体索引(src/graph.lume), 那是人工维护的映射,
+//    覆盖范围有限 —— 未覆盖的标的直接跳过, 不按代码前缀猜行业。
+//    猜出来的行业会让"行业异动"变成假的。
+import "fleet.lume" as fleet;
+import "graph.lume" as graph;
+
+// 异动阈值。这些是**业务参数**, 不是技术常数:
+// 波动率放大到近 N 日均值的多少倍算异动, 不同团队口径不同。
+func vol_spike_ratio(): float {
+  let v = env("SECTOR_VOL_SPIKE");
+  if (v == null or len(str(v)) == 0) { return 1.5; }
+  return float(v);
+}
+
+// 一个行业的当日画像。输入是该行业在索引里的标的代码列表。
+//
+// 为什么用"涨跌家数 + 平均动量 + 波动率"三个维度:
+//   * 单看涨跌幅会被一两只大票带偏;
+//   * 涨跌家数反映的是**面**上的方向;
+//   * 波动率回答"今天是不是有异样", 与涨跌方向无关 ——
+//     大跌和急涨都是异动, 但处理方式完全不同。
+export func profile(industry: string, codes) {
+  if (len(codes) == 0) {
+    return { industry: industry, count: 0, ok: false,
+             reason: "该行业在实体索引中没有标的" };
+  }
+  let r = fleet.invoke("scanner", "sector.snapshot", 25);
+  if (!get(r, "ok", false)) {
+    return { industry: industry, count: 0, ok: false,
+             reason: "scanner 不可用: " + str(get(r, "error", "")) };
+  }
+  let rows = get(get(r, "result", {}), "rows", []);
+  // 建 code → 当日行情 的索引
+  let by_code = {};
+  let i = 0;
+  while (i < len(rows)) {
+    let x = get(rows, i, {});
+    by_code = put(by_code, str(get(x, "code", "")), x);
+    i = i + 1;
+  }
+
+  let up = 0;
+  let down = 0;
+  let flat = 0;
+  let sum_chg = 0.0;
+  let sum_mom = 0.0;
+  let sum_vol = 0.0;
+  let used = 0;
+  // 各维度的有效样本数: 有的库只有基础字段, 没有动量/波动率。
+  // 分开计数, 才能说清"这个均值是基于几只算出来的"。
+  let mom_n = 0;
+  let vol_n = 0;
+  let j = 0;
+  while (j < len(codes)) {
+    let c = str(get(codes, j, ""));
+    let x = get(by_code, c, null);
+    if (x != null) {
+      let chg = float(get(x, "change_percent", 0.0));
+      if (chg > 0.5) { up = up + 1; }
+      else if (chg < -0.5) { down = down + 1; }
+      else { flat = flat + 1; }
+      sum_chg = sum_chg + chg;
+      // momentum / volatility 在样例库里可能是 null(lume 返回 null 而非 0)。
+      // 直接 float(null) 会抛错或得到意外的 0 —— 两种都会让"行业画像"
+      // 静默失真。所以显式判空: 拿不到就是拿不到, 不计入该维度。
+      let mv = get(x, "momentum_5d", null);
+      let vv = get(x, "volatility_20d", null);
+      if (mv != null) { sum_mom = sum_mom + float(mv); mom_n = mom_n + 1; }
+      if (vv != null) { sum_vol = sum_vol + float(vv); vol_n = vol_n + 1; }
+      used = used + 1;
+    }
+    j = j + 1;
+  }
+  if (used == 0) {
+    return { industry: industry, count: 0, ok: false,
+             reason: "该行业标的当日无行情数据" };
+  }
+  let avg_chg = sum_chg / float(used);
+  // 有效样本为 0 时该维度不可用。
+  // lume 不允许同一变量先赋 float 再赋 null(类型推断冲突), 所以用
+  // has_* 标记可用性, 数值本身在不可用时给 0 且**不被读取**。
+  let avg_mom = 0.0;
+  if (mom_n > 0) { avg_mom = round(sum_mom / float(mom_n) * 10000) / 10000; }
+  let avg_vol = 0.0;
+  if (vol_n > 0) { avg_vol = round(sum_vol / float(vol_n) * 100000) / 100000; }
+  return {
+    industry: industry,
+    count: used,
+    ok: true,
+    up: up, down: down, flat: flat,
+    avg_change: round(avg_chg * 100) / 100,
+    // 数值恒为 number; 是否可信看 has_* 标记(见下)。
+    // lume 不允许 map 字段在 float/null 之间摇摆, 所以不用 null 表示缺失。
+    avg_momentum: avg_mom,
+    avg_volatility: avg_vol,
+    // 维度可用性: 前端据此决定显示"动量"还是显示"该数据源不提供动量"
+    has_momentum: mom_n > 0,
+    has_volatility: vol_n > 0,
+    // 一句话描述: 只说"发生了什么", 不说"该怎么办"
+    headline: describe(up, down, flat, avg_chg, avg_mom, mom_n > 0),
+    reason: "",
+  };
+}
+
+// 把数字翻译成一句人话。刻意保持中性 ——
+// "整体走弱" 是事实, "需要回避" 就是建议了, 两者界线要清楚。
+func describe(up: int, down: int, flat: int, avg_chg: float, avg_mom: float,
+              has_mom: bool): string {
+  let dir = "涨跌互现";
+  if (down == 0 and up > 0) { dir = "普遍上涨"; }
+  else if (up == 0 and down > 0) { dir = "普遍下跌"; }
+  else if (up > down * 2) { dir = "多数上涨"; }
+  else if (down > up * 2) { dir = "多数下跌"; }
+  // 动量不可用时明说, 不给"中性" —— 那是把"没数据"说成"没变化"。
+  let mom = "动量数据不可用";
+  if (has_mom) {
+    mom = "动量中性";
+    if (avg_mom > 0.02) { mom = "近 5 日动量偏强"; }
+    else if (avg_mom < -0.02) { mom = "近 5 日动量偏弱"; }
+  }
+  return dir + "(" + str(up) + " 涨 / " + str(down) + " 跌), " + mom +
+         ", 均涨幅 " + str(round(avg_chg * 100) / 100) + "%";
+}
+
+// 扫描所有已知行业, 按"异动程度"排序。
+//
+// 排序依据: 涨跌家数分歧度(方向越一致越极端) + 动量绝对值。
+// 这不是"哪个行业最值得买"的排序, 而是"哪个行业今天最不平静"。
+export func scan() {
+  let industries = known_industries();
+  let out = [];
+  let i = 0;
+  while (i < len(industries)) {
+    let ind = str(get(industries, i, ""));
+    let codes = codes_of(ind);
+    let p = profile(ind, codes);
+    if (get(p, "ok", false)) { push(out, p); }
+    i = i + 1;
+  }
+  return sort_by_movement(out);
+}
+
+// 从实体索引里取所有行业名
+func known_industries() {
+  let ents = graph.all_entities();
+  let seen = {};
+  let out = [];
+  let i = 0;
+  while (i < len(ents)) {
+    let ind = str(get(get(ents, i, {}), "industry", ""));
+    if (len(ind) > 0 and get(seen, ind, "") == "") {
+      seen = put(seen, ind, "1");
+      push(out, ind);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 某行业下已知的证券代码
+func codes_of(industry: string) {
+  let ents = graph.all_entities();
+  let out = [];
+  let i = 0;
+  while (i < len(ents)) {
+    let e = get(ents, i, {});
+    if (str(get(e, "industry", "")) == industry) {
+      push(out, str(get(e, "code", "")));
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 按"动静大小"排序: 分歧度(涨跌家数接近 = 分歧大) + 动量强度
+func sort_by_movement(list) {
+  let a = [];
+  let i = 0;
+  while (i < len(list)) {
+    let x = get(list, i, {});
+    let score = movement_score(x);
+    let pos = 0;
+    let placed = false;
+    while (pos < len(a) and not placed) {
+      if (movement_score(get(a, pos, {})) < score) {
+        a = insert_at(a, pos, x);
+        placed = true;
+      }
+      pos = pos + 1;
+    }
+    if (not placed) { push(a, x); }
+    i = i + 1;
+  }
+  return a;
+}
+
+func movement_score(x) {
+  // 没有动量维度时只按平均涨跌幅排, 且不假装有动量
+  let m = 0.0;
+  if (get(x, "has_momentum", false) == true) { m = float(get(x, "avg_momentum", 0.0)); }
+  let c = float(get(x, "avg_change", 0.0));
+  if (m < 0) { m = 0 - m; }
+  if (c < 0) { c = 0 - c; }
+  return m * 100 + c;
+}
+
+func insert_at(a, pos: int, v) {
+  let out = [];
+  let i = 0;
+  while (i < pos) { push(out, get(a, i, null)); i = i + 1; }
+  push(out, v);
+  while (i < len(a)) { push(out, get(a, i, null)); i = i + 1; }
+  return out;
+}

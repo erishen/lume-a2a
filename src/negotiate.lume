@@ -1,0 +1,420 @@
+// src/negotiate.lume — A2A 协商: 两个 agent 各自带约束, 谈出一个双方接受的方案
+//
+// ══ 它和「按规则推荐」的本质区别 ═══════════════════════════════════
+// 之前那版(src/promote.lume)是我写死的: 客户→行业→标的→按分数排。
+// 那不需要两个 agent, 一个 SQL join 就够。
+//
+// 这里换成**协商**:
+//   1. 选股侧(scanner agent) 提一个候选方案, 附带它的理由与保留意见;
+//   2. 客户侧(crm agent) 拿自己的约束逐条审 —— 有冲突就退回, 并说明理由;
+//   3. 选股侧在**不违反自己约束**的前提下调整, 再交一次;
+//   4. 直到双方都接受, 或达到轮数上限(届时如实报告"未达成")。
+//
+// 为什么必须两边都有权否决:
+//   只有一方能提、另一方只能接受, 那不是协商, 是通知。真实的跨部门协作里
+//   客户方总能说"这个人不能推"/"这个客户刚投诉过" —— 把它建模成 veto
+//   而不是一个权重, 是因为有些约束不可交易(合规、关系)。
+//
+// ══ 什么是"最优" ═══════════════════════════════════════════════════
+// 不定义成一个分数。定义成: **双方都能接受, 且在可行域里选股侧评分最高**。
+// "最优"如果只是分数最高, 那它永远是选股侧自己说了算 —— 客户侧的意见
+// 就成了装饰。所以这里的"最优"是带约束的最优化: 先满足双方约束, 再比分数。
+//
+// ══ 现状(必须知道) ═════════════════════════════════════════════════
+// 两侧 agent 现在的"判断"是规则驱动的, 不是 LLM 推理:
+//   * 选股侧的提案 = 按 signal score 排序;
+//   * 客户侧的否决 = 明确列出的规则(客户价值、行业匹配、无信号)。
+// 这是**可复现**的协商, 但推理深度有限。接 LLM 之后, 两侧的提案/否决
+// 会变成自然语言论证 —— 接口不用改, 换掉 proposal() 与 review() 即可。
+// 这一点在页面上如实标注, 不假装是 LLM 在谈。
+import "fleet.lume" as fleet;
+import "graph.lume" as graph;
+import "industry.lume" as ind;
+
+// 协商轮数上限。第 3 轮还谈不拢, 说明约束本身冲突, 继续谈只是消耗。
+let MAX_ROUNDS = 3;
+
+// 客户侧要求的**最低商机阶段**。默认 3 = 谈判。
+//
+// 这是业务口径, 不是技术常数: 换个团队/换个季度就该调。抽出来是为了让
+// "为什么否决"可被质询 —— 说"该行业只到初步接洽, 未达谈判"比说"不合适"有用。
+func stage_floor(): int {
+  let v = env("OUTREACH_STAGE_FLOOR");
+  if (v == null or len(str(v)) == 0) { return 3; }
+  return int(v);
+}
+
+func stage_name(rank: int): string {
+  if (rank >= 4) { return "成交"; }
+  if (rank == 3) { return "谈判"; }
+  if (rank == 2) { return "方案"; }
+  if (rank == 1) { return "初步接洽"; }
+  return "无";
+}
+
+// 该行业客户所处的最高商机阶段。来自 crm.stages(只有计数, 无客户明细)。
+func industry_stage(industry: string) {
+  let r = fleet.invoke("crm", "crm.stages", 20);
+  if (!get(r, "ok", false)) {
+    return { stage_rank: 0, best_stage: "无", error: str(get(r, "error", "")) };
+  }
+  let rows = get(get(r, "result", {}), "industries", []);
+  let i = 0;
+  while (i < len(rows)) {
+    let x = get(rows, i, {});
+    if (str(get(x, "industry", "")) == industry) {
+      return { stage_rank: int(get(x, "stage_rank", 0)),
+               best_stage: str(get(x, "best_stage", "无")), error: "" };
+    }
+    i = i + 1;
+  }
+  return { stage_rank: 0, best_stage: "无", error: "" };
+}
+
+// ── 客户侧约束(可被否决的理由) ─────────────────────────────────────
+// 每条约束都要说清"为什么不可交易", 否则它会变成随手可以绕过的开关。
+func customer_veto(prop, ctx) {
+  let sign = get(prop, "signaled", false);
+  // 约束 1: 没有当日信号的不推。这条最容易被动摇("长期看好"), 所以写死:
+  // 推了没有当日依据的票, 客户经理没法对客户解释。
+  if (sign != true) {
+    return { veto: true, code: "NO_SIGNAL",
+             reason: "该标的当日无扫描信号, 无法给客户一个有依据的推荐理由" };
+  }
+  // 约束 2: 没有可对齐的实体不推。对不上工商主体 = 说不清是哪家公司。
+  let r = graph.resolve("", "", str(get(prop, "code", "")));
+  if (str(get(r, "status", "")) != "matched") {
+    return { veto: true, code: "UNALIGNED_ENTITY",
+             reason: "该标的未在实体索引中确认(USCC/代码), 无法确认对应哪家工商主体" };
+  }
+  // 约束 3: 当日跌幅超过 5% 的不推。不是"看空", 是当天不适合作为
+  // 推荐动作的开场 —— 客户第一反应会是"跌成这样你还推?"。
+  let ch = float(get(prop, "change", 0.0));
+  if (ch < -5.0) {
+    return { veto: true, code: "TODAY_DROP",
+             reason: "当日跌幅 " + str(ch) + "%, 不适合作为当日推荐开场" };
+  }
+  return { veto: false, code: "", reason: "" };
+}
+
+// ── 选股侧: 提出候选 ────────────────────────────────────────────────
+// 输入是被否决过的标的集合(avoid), 选股侧在**不违规**的前提下换一个。
+// 注意它不会为了"谈成"而随便让: 如果剩下的都不合格, 它就明说没有。
+export func propose(demand, avoid) {
+  let picks = fleet.invoke("scanner", "scanner.picks", 25);
+  if (!get(picks, "ok", false)) {
+    return { ok: false, error: str(get(picks, "error", "scanner 不可用")), top: null, applied: "" };
+  }
+  let list = get(get(picks, "result", {}), "picks", []);
+  let pool = [];
+  let i = 0;
+  while (i < len(list)) {
+    let p = get(list, i, {});
+    let code = str(get(p, "code", ""));
+    if (get(avoid, code, "") == "") {
+      push(pool, {
+        code: code,
+        name: str(get(p, "name", "")),
+        score: get(p, "score", 0),
+        change: get(p, "change", 0),
+        signals: get(p, "signals", []),
+        signaled: true,
+      });
+    }
+    i = i + 1;
+  }
+
+  // 执行客户侧上一轮的要求。这是"让步"的具体形式:
+  // 选股侧不是随便换一个, 而是**按对方指的方向**换。
+  let applied = "";
+  let dk = "";
+  if (demand != null) { dk = str(get(demand, "kind", "")); }
+  if (dk == "stage" or dk == "industry") {
+    let need = stage_floor();
+    if (dk == "stage") {
+      // 用对方**最新**的要求(next_floor), 而不是最初提的那个。
+      // 谈判里对方松口了, 你还按老条件筛 —— 那就等于没在听。
+      need = int(get(demand, "next_floor", get(demand, "min", stage_floor())));
+    }
+    let keep = [];
+    let j = 0;
+    while (j < len(pool)) {
+      let c = get(pool, j, {});
+      let rec = get(graph.resolve("", "", str(get(c, "code", ""))), "record", null);
+      let industry = "";
+      if (rec != null) { industry = str(get(rec, "industry", "")); }
+      let st = industry_stage(industry);
+      if (int(get(st, "stage_rank", 0)) >= need) { push(keep, c); }
+      j = j + 1;
+    }
+    pool = keep;
+    applied = "只保留客户已进入「" + stage_name(need) + "」阶段的行业";
+  } else if (dk == "signal") {
+    applied = "只保留当日有信号的";
+  } else if (dk == "change") {
+    let keep2 = [];
+    let k = 0;
+    let m = float(get(demand, "min", -5.0));
+    while (k < len(pool)) {
+      let c = get(pool, k, {});
+      if (float(get(c, "change", 0)) >= m) { push(keep2, c); }
+      k = k + 1;
+    }
+    pool = keep2;
+    applied = "只保留当日跌幅小于 " + str(m) + "% 的";
+  }
+
+  let sorted = sort_desc(pool, "score");
+  let top = null;
+  if (len(sorted) > 0) { top = get(sorted, 0, null); }
+  return { ok: true, error: "", top: top, applied: applied, remaining: len(sorted) };
+}
+
+func sort_desc(list, key: string) {
+  let a = [];
+  let i = 0;
+  while (i < len(list)) {
+    let t = get(list, i, {});
+    let v = float(get(t, key, 0));
+    let pos = 0;
+    let placed = false;
+    while (pos < len(a) and not placed) {
+      if (float(get(get(a, pos, {}), key, 0)) < v) {
+        a = insert_at(a, pos, t);
+        placed = true;
+      }
+      pos = pos + 1;
+    }
+    if (not placed) { push(a, t); }
+    i = i + 1;
+  }
+  return a;
+}
+
+func insert_at(a, pos: int, v) {
+  let out = [];
+  let i = 0;
+  while (i < pos) { push(out, get(a, i, null)); i = i + 1; }
+  push(out, v);
+  while (i < len(a)) { push(out, get(a, i, null)); i = i + 1; }
+  return out;
+}
+
+// ── 客户侧: 拿一个标的去审 ──────────────────────────────────────────
+// 除了通用约束, 还要看它属于哪个行业、对应哪些客户, 给出"为什么是它"。
+export func review(prop) {
+  let v = customer_veto(prop, {});
+  if (get(v, "veto", false) == true) { return v; }
+  let code = str(get(prop, "code", ""));
+  let rec = get(graph.resolve("", "", code), "record", null);
+  let industry = "";
+  if (rec != null) { industry = str(get(rec, "industry", "")); }
+  let cust = industry_customers(industry);
+  if (len(cust) == 0) {
+    // 行业对该客户群无对应: 不否决(标的本身没问题), 但要说清"没有可推的客户"
+    return { veto: true, code: "NO_CUSTOMER_FIT",
+             reason: "该标的属于" + industry + ", 当前客户群中没有该行业客户" };
+  }
+  // 约束 4: 该行业必须有客户进入**谈判阶段**。
+  //
+  // 这是选股侧与客户侧真正的冲突点, 而且它不是人为设的阈值 ——
+  // 它来自两边的目标本身:
+  //   选股侧: 按信号强度排序, 谁分高推谁;
+  //   客户侧: 谈判阶段的客户最接近成交, 同样的沟通成本应该优先投给他们。
+  //
+  // 冲突会真实发生: 信号最强的那只, 往往不在有谈判客户的行业里。
+  // 这时双方必须谈 —— 要么选股侧让出最高分, 要么客户侧接受"先培育、
+  // 不谈成交"。谁都不该无条件让步。
+  let st = industry_stage(industry);
+  let rank = int(get(st, "stage_rank", 0));
+  if (rank < stage_floor()) {
+    return { veto: true, code: "STAGE_TOO_EARLY", industry: industry,
+             best_stage: str(get(st, "best_stage", "无")),
+             reason: "该行业最高只到「" + str(get(st, "best_stage", "无")) +
+                     "」阶段, 未达当前要求「" + stage_name(stage_floor()) +
+                     "」; 站在客户侧, 同样的沟通成本应优先投给进度更靠前的客户" };
+  }
+  return { veto: false, code: "", industry: industry,
+           stage_rank: rank, best_stage: str(get(st, "best_stage", "")),
+           reason: "该行业有客户处于「" + str(get(st, "best_stage", "")) +
+                   "」阶段, 达到要求" };
+}
+
+// 用当前轮次的门槛来审(门槛会随谈判下降)
+export func review_with_floor(prop, floor_val: int) {
+  let v = customer_veto(prop, {});
+  if (get(v, "veto", false) == true) { return v; }
+  let code = str(get(prop, "code", ""));
+  let rec = get(graph.resolve("", "", code), "record", null);
+  let industry = "";
+  if (rec != null) { industry = str(get(rec, "industry", "")); }
+  let st = industry_stage(industry);
+  let rank = int(get(st, "stage_rank", 0));
+  let best = str(get(st, "best_stage", "无"));
+  if (rank <= 0) {
+    return { veto: true, code: "NO_CUSTOMER_FIT", industry: industry,
+             reason: "该标的属于" + industry + ", 当前没有该行业客户的商机记录" };
+  }
+  if (rank < floor_val) {
+    return { veto: true, code: "STAGE_TOO_EARLY", industry: industry, best_stage: best,
+             reason: "该行业最高只到「" + best + "」, 低于当前要求的「" +
+                     stage_name(floor_val) + "」" };
+  }
+  return { veto: false, code: "", industry: industry, best_stage: best,
+           reason: "该行业有客户处于「" + best + "」阶段(要求「" + stage_name(floor_val) + "」)" };
+}
+
+// 客户侧能看到的"该行业有几个客户"。来自 crm 的行业聚合(不含客户明细)。
+func industry_customers(industry: string) {
+  let r = fleet.invoke("crm", "crm.industries", 20);
+  if (!get(r, "ok", false)) { return []; }
+  let rows = get(get(r, "result", {}), "industries", []);
+  let i = 0;
+  while (i < len(rows)) {
+    let x = get(rows, i, {});
+    if (str(get(x, "industry", "")) == industry) {
+      return [{ industry: industry, customers: int(get(x, "customers", 0)) }];
+    }
+    i = i + 1;
+  }
+  return [];
+}
+
+// ── 主流程: 多轮协商 ────────────────────────────────────────────────
+// 返回完整对话记录。每轮都留下: 谁提的、另一方为什么接受/否决。
+// 没有这份记录, "达成共识"就只是一句结论, 没法复核。
+export func negotiate(goal: string) {
+  let avoid = {};
+  let rounds = [];
+  let accepted = null;
+  let round = 0;
+  // 客户侧在否决时给出的"下轮该怎么提"的建议。选股侧必须在下一轮遵守,
+  // 否则就是"你说你的, 我做我的" —— 那不是协商。
+  let demand = null;
+  // 客户侧的门槛会随轮次下降。谈判里"谈不拢"的常见解法不是一方硬扛,
+  // 而是**双方各自松动一点** —— 选股侧换标的, 客户侧降门槛。
+  // 不建模这一步的话, 只要初始阈值定得偏高, 协商永远以"无解"收场,
+  // 而那并不是业务真的无解, 只是阈值没谈。
+  let floor_now = stage_floor();
+
+  while (round < MAX_ROUNDS and accepted == null) {
+    round = round + 1;
+
+    // ── 选股侧提案: 每轮只提一个 ────────────────────────────────────
+    //
+    // 为什么每轮只提一个: 一次丢出全部候选让客户侧"挑", 那是一张报价单,
+    // 不是谈判。谈判是一个回合一个提议, 对方否了再调整。
+    let p = propose(demand, avoid);
+    if (!get(p, "ok", false)) {
+      push(rounds, { round: round, role: "scanner", action: "blocked",
+                     text: "选股侧不可用: " + str(get(p, "error", "")) });
+      break;
+    }
+    let top = get(p, "top", null);
+    let applied = get(p, "applied", "");
+    if (top == null) {
+      push(rounds, { round: round, role: "scanner", action: "exhausted",
+                     text: "在客户侧约束下已没有可提的标的" });
+      break;
+    }
+    push(rounds, {
+      round: round, role: "scanner", action: "propose",
+      code: str(get(top, "code", "")), name: str(get(top, "name", "")),
+      text: "提议 " + str(get(top, "name", "")) + "(score " + str(get(top, "score", 0)) + ")" +
+            (len(applied) > 0 ? "; 已按客户侧要求调整: " + applied : ""),
+    });
+
+    // ── 客户侧审议 ────────────────────────────────────────────────
+    let rv = review_with_floor(top, floor_now);
+    if (get(rv, "veto", false) != true) {
+      accepted = top;
+      accepted = put(accepted, "agreed_stage", stage_name(floor_now));
+      push(rounds, {
+        round: round, role: "crm", action: "accept",
+        code: str(get(top, "code", "")), name: str(get(top, "name", "")),
+        industry: str(get(rv, "industry", "")),
+        text: str(get(rv, "reason", "")),
+      });
+    } else {
+      avoid = put(avoid, str(get(top, "code", "")), "1");
+      // 客户侧不能只说"不行", 要说"怎样才能行" —— 否则选股侧没法调整
+      demand = demand_of(rv, top);
+      // 让步: 下一轮把阶段要求降一档, 但不低于 1(初步接洽)。
+      // 降档也是让步, 必须说出来 —— 默默放宽等于没谈。
+      //
+      // 例外: 如果对方那条根本没有商机记录(NO_CUSTOMER_FIT), 降阶段要求
+      // 没有任何意义 —— 降到"初步接洽"也还是零。这种时候装作可以让步
+      // 比不改更糟: 会让对方以为再等等就有解, 实际永远不会。
+      let rc = str(get(rv, "code", ""));
+      if (floor_now > 1 and rc != "NO_CUSTOMER_FIT") {
+        floor_now = floor_now - 1;
+        demand = put(demand, "next_floor", floor_now);
+        demand = put(demand, "text", str(get(demand, "text", "")) +
+                    "; 若仍无可选, 我方可将阶段要求降到「" + stage_name(floor_now) + "」");
+      }
+      // 关键: **只要 demand 里带了 next_floor, 就必须同步到 floor_now**。
+      //
+      // 上一轮就栽在这里: NO_CUSTOMER_FIT 那条路的确说了"阶段不限",
+      // 但没走上面那个降档分支, 于是 floor_now 还停在 3(谈判)。
+      // 下一轮客户侧仍按 3 审, 把刚放宽的条件又收紧了 —— 表现为
+      // "客户侧先说阶段不限, 转头又要求必须到谈判", 看上去像自相矛盾,
+      // 实际是两处状态没同步。
+      let nf = get(demand, "next_floor", null);
+      if (nf != null and int(nf) < floor_now) { floor_now = int(nf); }
+      push(rounds, {
+        round: round, role: "crm", action: "reject",
+        code: str(get(top, "code", "")), name: str(get(top, "name", "")),
+        code_reason: str(get(rv, "code", "")),
+        text: str(get(rv, "reason", "")) + " -> 要求: " + str(get(demand, "text", "")),
+      });
+    }
+  }
+
+  return {
+    goal: goal,
+    rounds: rounds,
+    round_count: round,
+    converged: accepted != null,
+    plan: accepted,
+    verdict: conclusion(accepted, round, avoid),
+  };
+}
+
+// 把一个否决理由翻译成"下一轮该怎么提"。
+// 这一步是协商能否收敛的关键: 只会说 no 的对手方, 会让谈判原地打转。
+func demand_of(rv, prop) {
+  let code = str(get(rv, "code", ""));
+  if (code == "STAGE_TOO_EARLY") {
+    return { kind: "stage", min: stage_floor(),
+             text: "换一个客户已进入「" + stage_name(stage_floor()) + "」阶段的行业" };
+  }
+  if (code == "NO_CUSTOMER_FIT") {
+    // 要求不是"换一个高级阶段的行业", 是"换一个**有商机记录**的行业" ——
+    // 两者差一档: 有记录(rank>=1)远弱于"到谈判"(rank>=3)。
+    // 早先这里返回 kind=industry, 而 propose 的 industry 分支用 stage_floor()
+    // 当门槛, 于是要求被误读成"必须到谈判" —— 结果把所有只在初步接洽、
+    // 但明明满足"有记录"的行业全排除了, 协商以 exhausted 收场。
+    // 那不是说"没有候选", 是说"我把条件读严了"。
+    return { kind: "stage", min: 1, next_floor: 1,
+             text: "换一个客户侧有商机记录的行业(阶段不限, 初步接洽即可)" };
+  }
+  if (code == "NO_SIGNAL") {
+    return { kind: "signal", text: "只提当日有扫描信号的标的" };
+  }
+  if (code == "TODAY_DROP") {
+    return { kind: "change", min: -5.0, text: "换一个当日跌幅小于 5% 的标的" };
+  }
+  return { kind: "generic", text: "换一个候选" };
+}
+
+func conclusion(accepted, round: int, avoid) {
+  if (accepted == null) {
+    return "未达成一致: " + str(round) + " 轮内客户侧未接受任何候选";
+  }
+  let nv = len(keys(avoid));
+  if (nv == 0) {
+    return "首轮即达成一致: " + str(get(accepted, "name", "")) + " 通过客户侧全部约束";
+  }
+  return "第 " + str(round) + " 轮达成一致: 客户侧否决了 " + str(nv) +
+         " 个候选后, " + str(get(accepted, "name", "")) + " 通过";
+}

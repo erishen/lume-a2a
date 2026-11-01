@@ -1,0 +1,148 @@
+// src/trace.lume — Agent 之间的调用留痕(append-only JSONL)
+//
+// ══ 为什么需要它 ═══════════════════════════════════════════════════
+// 这个项目有四个角色在协作:
+//   浏览器 → lume-a2a(编排) → crm / scanner(数据节点)
+// 平时只有一个"结论"能看见, **中间过程是黑的**。出了问题只能猜是哪个环节。
+//
+// 所以每次跨节点调用都记一笔: 谁调的、调了什么、多久、成没成。
+// 不做聚合、不做采样 —— 一份 append-only 流水, 出事时能倒着查。
+//
+// ══ 为什么是 JSONL ═════════════════════════════════════════════════
+// 一行一条, 追加写。不需要读改写整个文件, 也就没有并发覆盖问题
+// (lume 的 workers=2)。代价是查询要自己扫, 但演示量级足够。
+//
+// ══ 记录什么、不记什么 ═════════════════════════════════════════════
+// 记: 时间 / 调用方 / 被调节点 / 能力名 / 结果大小 / 成败 / 错误摘要
+// 不记: 完整返回体(可能很大)、任何凭据、客户明细
+//
+// ⚠️ **没有毫秒耗时**。lume 的 now() 是秒级(time()), strftime 也只到秒。
+// 本机调用通常 <10ms, 用 now() 相减永远是 0 —— 与其显示一个恒为 0 的
+// "耗时 0ms"(看着像没在测), 不如不测这一项。页面上把"结果大小"作为
+// 主指标: 它至少能说明"这次调用真的拿到了东西, 还是空手而归"。
+//
+// 这不是为了"日志好看" —— 是为了让 Agent 页能回答一个具体问题:
+// **"这次结论是经过哪几个节点、花多久、有没有重试才拿到的"**。
+import "../../lume-core/lib/peer.lume" as peer;
+
+let trace_path = "/app/.data/agent-trace.jsonl";
+// 单文件上限。超过就截断重写(保留最近一半), 防止长期运行把磁盘写满。
+// 为什么不用轮转多文件: 读的时候要合并多个文件, 收益不值;
+// 演示场景下"最近一半"就够回溯了。
+let max_lines = 2000;
+
+func ensure_dir() {
+  mkdir("/app/.data");
+}
+
+// 写一笔。字段顺序固定, 便于人眼扫。
+//
+// 失败不抛错: 留痕本身不该把业务搞挂。调用方也不该因为"写日志失败"
+// 就认为业务失败 —— 那会把一个可忽略的问题放大成事故。
+export func record(from: string, to: string, cap: string, ms: int, ok: bool,
+                   err: string, bytes: int, extra: string) {
+  // ms 参数保留但不用于展示: 调用方仍传, 便于将来 lume 支持毫秒时直接用。
+  // 现在写进去的值恒为 0, 读的一侧据此放弃这一项。
+  ensure_dir();
+  let line = stringify({
+    ts: int(now()),
+    from: from,
+    to: to,
+    cap: cap,
+    ms: ms,
+    ok: ok,
+    err: err,
+    bytes: bytes,
+    note: extra,
+  });
+  // 追加写。lume 没有 append 内建, 只能读-拼-写。
+  // workers=2 时理论上会丢写, 但丢的是"某一次调用的记录",
+  // 不是业务数据 —— 这个代价可以接受, 且比加锁简单。
+  let cur = read_file(trace_path);
+  let body = line + "\n";
+  if (cur != null and len(str(cur)) > 0) {
+    body = str(cur) + body;
+  }
+  let lines = split(trim(body), "\n");
+  if (len(lines) > max_lines) {
+    // 保留最近一半
+    let keep = [];
+    let i = len(lines) - max_lines;
+    while (i < len(lines)) {
+      push(keep, str(get(lines, i, "")));
+      i = i + 1;
+    }
+    body = join(keep, "\n") + "\n";
+  }
+  let w = try(() => write_file(trace_path, body));
+  return w.err == null;
+}
+
+// 读最近 n 笔(倒序: 最新的在前)。
+//
+// 逐行解析并**跳过坏行** —— 并发写可能留下半截 JSON,
+// 一行读不了不该让整个列表变空(而那正是最需要看的时候)。
+export func recent(n: int) {
+  let txt = read_file(trace_path);
+  if (txt == null) { return []; }
+  let lines = split(trim(str(txt)), "\n");
+  let out = [];
+  let i = len(lines) - 1;
+  while (i >= 0 and len(out) < n) {
+    let raw = str(get(lines, i, ""));
+    if (len(raw) > 2) {
+      let p = try(() => json(raw));
+      if (p.err == null and p.ok != null) {
+        push(out, p.ok);
+      }
+    }
+    i = i - 1;
+  }
+  return out;
+}
+
+// 汇总: 给 Agent 页顶部的几个数字。
+// 只统计最近 n 笔, 与列表口径一致 —— 否则"总计 500 次"配着"最近 20 条"
+// 会让人以为列表被截断了。
+export func stats(n: int) {
+  let rows = recent(n);
+  let ok = 0;
+  let fail = 0;
+  let total_bytes = 0;
+  let by_cap = {};
+  let by_node = {};
+  let i = 0;
+  while (i < len(rows)) {
+    let r = get(rows, i, {});
+    if (get(r, "ok", false) == true) { ok = ok + 1; } else { fail = fail + 1; }
+    total_bytes = total_bytes + int(get(r, "bytes", 0));
+    let c = str(get(r, "cap", ""));
+    by_cap = put(by_cap, c, int(get(by_cap, c, 0)) + 1);
+    let t = str(get(r, "to", ""));
+    by_node = put(by_node, t, int(get(by_node, t, 0)) + 1);
+    i = i + 1;
+  }
+  let caps = [];
+  let ck = keys(by_cap);
+  let j = 0;
+  while (j < len(ck)) {
+    push(caps, { cap: str(get(ck, j, "")), count: int(get(by_cap, str(get(ck, j, "")), 0)) });
+    j = j + 1;
+  }
+  let nodes = [];
+  let nk = keys(by_node);
+  let k = 0;
+  while (k < len(nk)) {
+    push(nodes, { node: str(get(nk, k, "")), count: int(get(by_node, str(get(nk, k, "")), 0)) });
+    k = k + 1;
+  }
+  return {
+    window: len(rows),
+    ok: ok,
+    fail: fail,
+    // 不提供 avg_ms: lume 的时间精度是秒, 这栏永远是 0, 给了反而误导。
+    total_bytes: total_bytes,
+    by_cap: caps,
+    by_node: nodes,
+  };
+}

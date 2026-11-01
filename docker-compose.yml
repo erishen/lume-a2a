@@ -1,0 +1,58 @@
+# lume-a2a —— 一个演示节点, 接真实 peer(crm / scanner)
+#
+# 为什么只起一个容器而不像之前那样起两个:
+#   crm 与 scanner 是**已经跑着的真实项目**, 它们各自有自己的 peer 服务
+#   (18102 / 18103)。再起两个自造节点没有信息量; 让本节点去调它们,
+#   才叫"演示跨项目互访"。
+#
+# 凭据: PEER_ROOT 从 .env 读(gitignore), 仓库里只有 .env.example。
+#   两个真实节点跑 derived 模式, 用同一个 root 派生各节点密钥 —— 所以我们
+#   必须用同一个 root, 配 PEER_SHARED 的话签名算得出但**是错的**, 对端一律
+#   回 bad signature, 而报错完全指不到"模式不匹配"。
+#
+# 网络: crm/scanner 在宿主上跑(不是容器), 所以容器内要访问
+#   host.docker.internal:18102。直接在容器网络里用 127.0.0.1 是指容器自己。
+
+services:
+  lume-a2a:
+    build:
+      context: .
+      args:
+        LUME_VERSION: "${LUME_VERSION:-v0.11.0}"
+    image: lume-a2a
+    container_name: lume-a2a
+    restart: unless-stopped
+    ports:
+      # 只绑 127.0.0.1: 控制台 /api/* 不鉴权(只读 + 无凭据), 不该对整个局域网开放。
+      - "127.0.0.1:${A2A_PORT:-10190}:18190"
+    environment:
+      PEER_NAME: "${PEER_NAME:-lume-a2a}"
+      PEER_PORT: "18190"
+      PEER_BIND: "0.0.0.0"
+      # derived 模式的身份根。没配 = peer 面整体关闭(fail-closed), 不是放行。
+      PEER_ROOT: "${PEER_ROOT:?请在 .env 配 PEER_ROOT(与 crm/scanner 一致), 或参考 .env.example}"
+      # Agent Card 里宣告的对外地址。容器内 127.0.0.1 指向自己, 必须显式给。
+      PEER_PUBLIC_URL: "http://127.0.0.1:${A2A_PORT:-10190}"
+      # 真实节点地址。容器内用 host.docker.internal 指宿主。
+      PEER_FLEET: "${PEER_FLEET:-crm=host.docker.internal:18102,scanner=host.docker.internal:18103}"
+      # ── 「问 Agent」页的模型配置 ──
+      # 这里传的是**运行时的值**, 不进镜像层: 镜像里只有代码。
+      # 框架在启动时读 .env, 而容器的 CWD=/app 里没有 .env(也不该有),
+      # 所以必须由 compose 从宿主 .env 注入这三个变量。
+      LLM_API_URL: "${LLM_API_URL:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_TIMEOUT: "90"
+      # 业务边界提示词。框架把它拼到系统提示后面。
+      # 内容来自 prompts/agent_ask.md —— 但 compose 只能传**字符串**,
+      # 不支持"从文件读内容"。所以这里用 shell 展开在启动前读入
+      # (见 Makefile 的 docker-up 目标设 LLM_SYSTEM_EXTRA)。
+      # 不把提示词直接写进这一行: 那是一段会反复改的文本, 塞进 YAML
+      # 就没法 diff、也没法和 prompts/ 里的其他提示词放一起看。
+      LLM_SYSTEM_EXTRA: "${LLM_SYSTEM_EXTRA:-}"
+    extra_hosts:
+      # Linux 上 host.docker.internal 不自动存在; macOS 上这一行无害。
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 本节点的任务/状态。名字带节点名, 与真实节点互不干扰。
+      - ./data/self:/app/.data

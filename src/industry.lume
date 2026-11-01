@@ -1,0 +1,156 @@
+// src/industry.lume — 行业映射表(客户公司 ↔ A 股标的)
+//
+// ⚠️ 这张表是**人工维护的映射**, 不是 crm / scanner 的真实数据。
+//
+// 为什么必须单独成表并写清来源:
+//   scanner 的 picks 只给 code / name / close / signals / score, **没有行业字段**;
+//   crm 的客户只有 name / company / pipeline, 也没有行业。
+//   两边都没有"行业", 所以"按行业关联"这件事本身需要一张映射表来支撑。
+//   把它藏进业务代码里, 读的人会以为行业是上游给的 —— 那是错的, 而且
+//   一旦某只股票改行/被并购, 没人知道该改哪里。
+//
+// 维护方式: 改下面两张表即可, 不需要动业务逻辑。
+//   1) STOCK_INDUSTRY: 股票名 → 行业(键用去掉空格的名字, scanner 返回的
+//      "五 粮 液" 与 "五粮液" 要能对上, 见 normalize())
+//   2) COMPANY_INDUSTRY: 客户公司 → 行业(按公司名关键词归类, 认不出就返回 "")
+//
+// 认不出行业时**返回空串**, 由调用方标为"未归类"。不猜 —— 猜错会把
+// 制造类客户推进白酒股, 而这种错误在推荐场景里是灾难性的。
+
+// ── 股票 → 行业 ─────────────────────────────────────────────────────
+// 覆盖 scanner 标的池中与客户行业相关的部分(金融/信息技术/食品饮料/电力设备/
+// 汽车/钢铁/交通运输/房地产)。池子外的标的归为未归类 —— 不猜行业。
+let STOCK_INDUSTRY = [
+  { "code": "sh601398", "name": "工商银行", "industry": "金融" },
+  { "code": "sh601939", "name": "建设银行", "industry": "金融" },
+  { "code": "sh601288", "name": "农业银行", "industry": "金融" },
+  { "code": "sh601988", "name": "中国银行", "industry": "金融" },
+  { "code": "sh601328", "name": "交通银行", "industry": "金融" },
+  { "code": "sh601658", "name": "邮储银行", "industry": "金融" },
+  { "code": "sh600036", "name": "招商银行", "industry": "金融" },
+  { "code": "sh601318", "name": "中国平安", "industry": "金融" },
+  { "code": "sh601628", "name": "中国人寿", "industry": "金融" },
+  { "code": "sh600941", "name": "中国移动", "industry": "信息技术" },
+  { "code": "sh601728", "name": "中国电信", "industry": "信息技术" },
+  { "code": "sh601138", "name": "工业富联", "industry": "信息技术" },
+  { "code": "sh688981", "name": "中芯国际", "industry": "信息技术" },
+  { "code": "sh688256", "name": "寒武纪", "industry": "信息技术" },
+  { "code": "sh688041", "name": "海光信息", "industry": "信息技术" },
+  { "code": "sz300308", "name": "中际旭创", "industry": "信息技术" },
+  { "code": "sz300502", "name": "新易盛", "industry": "信息技术" },
+  { "code": "sh600037", "name": "歌华有线", "industry": "信息技术" },
+  { "code": "sh600519", "name": "贵州茅台", "industry": "食品饮料" },
+  { "code": "sz000858", "name": "五粮液", "industry": "食品饮料" },
+  { "code": "sz300750", "name": "宁德时代", "industry": "电力设备" },
+  { "code": "sh600021", "name": "上海电力", "industry": "电力设备" },
+  { "code": "sh600023", "name": "浙能电力", "industry": "电力设备" },
+  { "code": "sh600027", "name": "华电国际", "industry": "电力设备" },
+  { "code": "sh600032", "name": "浙江新能", "industry": "电力设备" },
+  { "code": "sh600900", "name": "长江电力", "industry": "电力设备" },
+  { "code": "sh600006", "name": "东风股份", "industry": "汽车" },
+  { "code": "sz002594", "name": "比亚迪", "industry": "汽车" },
+  { "code": "sh600010", "name": "包钢股份", "industry": "钢铁" },
+  { "code": "sh600022", "name": "山东钢铁", "industry": "钢铁" },
+  { "code": "sh600009", "name": "上海机场", "industry": "交通运输" },
+  { "code": "sh600029", "name": "南方航空", "industry": "交通运输" },
+  { "code": "sh600004", "name": "白云机场", "industry": "交通运输" },
+  { "code": "sh600012", "name": "皖通高速", "industry": "交通运输" },
+  { "code": "sh600017", "name": "日照港", "industry": "交通运输" },
+  { "code": "sh600020", "name": "中原高速", "industry": "交通运输" },
+  { "code": "sh600033", "name": "福建高速", "industry": "交通运输" },
+  { "code": "sh600035", "name": "楚天高速", "industry": "交通运输" },
+  { "code": "sh600007", "name": "中国国贸", "industry": "房地产" },
+  { "code": "sz000002", "name": "万科Ａ", "industry": "房地产" },
+];
+
+// ── 客户公司 → 行业 ─────────────────────────────────────────────────
+// 用**关键词**而不是精确匹配: 客户名是用户自己录的, 不可能穷举。
+// 顺序有意义 —— 先匹配的更具体(例如"资本/投资"要先于通用的"科技")。
+let COMPANY_RULES = [
+  { "kw": "资本", "industry": "金融" },
+  { "kw": "投资", "industry": "金融" },
+  { "kw": "证券", "industry": "金融" },
+  { "kw": "基金", "industry": "金融" },
+  { "kw": "银行", "industry": "金融" },
+  { "kw": "能源", "industry": "电力设备" },
+  { "kw": "科技", "industry": "信息技术" },
+  { "kw": "软件", "industry": "信息技术" },
+  { "kw": "网络", "industry": "信息技术" },
+  { "kw": "数据", "industry": "信息技术" },
+  { "kw": "汽车", "industry": "汽车" },
+  { "kw": "物流", "industry": "交通运输" },
+  { "kw": "航运", "industry": "交通运输" },
+  { "kw": "置业", "industry": "房地产" },
+  { "kw": "地产", "industry": "房地产" },
+  { "kw": "食品", "industry": "食品饮料" },
+  { "kw": "酒业", "industry": "食品饮料" },
+  { "kw": "钢", "industry": "钢铁" },
+];
+
+// 去掉空格: scanner 返回 "五 粮 液"(语料里就是分字), 我们表里写 "五粮液"。
+// 不归一化的话, 按名字查永远查不到 —— 而我们不会立刻发现, 因为
+// 查不到只是"未归类", 页面看起来依然正常。
+export func normalize(s: string): string {
+  return replace(str(s), " ", "");
+}
+
+// 客户公司 → 行业; 认不出返回 ""
+export func industry_of_company(company: string): string {
+  let c = str(company);
+  let i = 0;
+  while (i < len(COMPANY_RULES)) {
+    let r = get(COMPANY_RULES, i, {});
+    if (len(str_match("^.*" + str(get(r, "kw", "")) + ".*$", c)) > 0) {
+      return str(get(r, "industry", ""));
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+// 该行业下有哪些标的(按 code 查表)。返回 [{code, name, industry}]
+export func stocks_in(industry: string): list {
+  let out = [];
+  let i = 0;
+  while (i < len(STOCK_INDUSTRY)) {
+    let s = get(STOCK_INDUSTRY, i, {});
+    if (str(get(s, "industry", "")) == industry) {
+      push(out, { code: str(get(s, "code", "")),
+                  name: str(get(s, "name", "")),
+                  industry: industry });
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 按股票名/代码查行业; 查不到 ""
+export func industry_of_stock(code: string, name: string): string {
+  let c = str(code);
+  let n = normalize(name);
+  let i = 0;
+  while (i < len(STOCK_INDUSTRY)) {
+    let s = get(STOCK_INDUSTRY, i, {});
+    if (str(get(s, "code", "")) == c or normalize(str(get(s, "name", ""))) == n) {
+      return str(get(s, "industry", ""));
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+// 本表覆盖的行业(供页面提示"我们认识哪些行业")
+export func industries() {
+  let seen = {};
+  let out = [];
+  let i = 0;
+  while (i < len(STOCK_INDUSTRY)) {
+    let ind = str(get(get(STOCK_INDUSTRY, i, {}), "industry", ""));
+    if (get(seen, ind, "") == "") {
+      seen = put(seen, ind, "1");
+      push(out, ind);
+    }
+    i = i + 1;
+  }
+  return out;
+}

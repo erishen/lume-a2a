@@ -1,0 +1,215 @@
+// peer_proto.lume — peer 节点之间「一条消息」的形状与编解码
+//
+// 分工:
+//   ../../lume-core/lib/peer.lume  = 签名 / 验签 / 单次请求(薄标准库, 只依赖内建)
+//   本文件                          = 一帧消息怎么拼、怎么拆、怎么路由
+//
+// ── 为什么帧走 query 串 ────────────────────────────────────────────
+// lib/peer.lume 文件头第 1 条: route handler **读不到请求头**。所以 node / ts /
+// nonce / sig 已经在 query 里; 帧本身也放 query, 好处是 query 参与签名 scope,
+// 改一个字段就验签失败(篡改 envelope = 端到端拒绝, 而不是被当成新消息)。
+//
+// ── 为什么文本要转义 ────────────────────────────────────────────────
+// 帧里有用户输入的自然语言。`&` `=` `?` `#` 直接进 query 会把字段切错;
+// 换行 / 空格在 URL 里也容易被中间层改写。
+//
+// 规则: 只保留安全白名单 [A-Za-z0-9._-], 其余一律 `~` + 两位十六进制。
+// 输出因此只含 ASCII 安全字符, 对 URL 与签名都无歧义。
+//
+// ── 已知边界(写清楚, 免得对端以为能传文档) ────────────────────────
+// lume 的字符串按**字节**计长(len("中")==3), 但没有「取第 i 个字节的数值」
+// 的内建: substr 切出来的单字节在比较/解析时不稳定, str_match 的 `\xNN` 又是
+// C 转义(len("\x01")==3)。所以本层**只保证 ASCII 保真**:
+//   * ASCII 可打印字符 → 原样(安全字符)或 ~XX;
+//   * 非 ASCII 字节 → 统一 `~3F`, 接收方得到 `?`, 明确表示"此处有非 ASCII"。
+// 需要无损传中文/富文本时走 A2A 的 JSON body(artifacts), 那里没有这个限制。
+let HEXC = "0123456789ABCDEF";
+// 常见可打印 ASCII 的数值表(按字符顺序排, 便于查)。没列到的一律 ~3F。
+let ASCII_SAFE = " !\"$%&'()*+,/:;<=>?@[\\]^`{|}~";
+let ASCII_CODES = [32, 33, 34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 47, 58, 59,
+                   60, 61, 62, 63, 64, 91, 92, 93, 94, 96, 123, 124, 125, 126];
+
+// 字符是否需要转义。安全白名单: 字母数字与 . _ -
+func needs_esc(ch: string): bool {
+  if (len(ch) != 1) { return true; }
+  if (len(str_match("^[A-Za-z0-9._-]$", ch)) > 0) { return false; }
+  return true;
+}
+
+// 单字符 → 两位十六进制。
+//   * 空白('\n' '\t' ' ' 等) 有明确含义, 单独映射;
+//   * 其它 ASCII 可打印字符查表;
+//   * 非 ASCII / 未列出的字节 → "3F"('?'), 见文件头的已知边界。
+func byte_hex(ch: string): string {
+  let code = ascii_code(ch);
+  if (code < 0) { return "3F"; }
+  return substr(HEXC, floor(code / 16), 1) + substr(HEXC, code % 16, 1);
+}
+
+func ascii_code(ch: string): int {
+  if (ch == " ") { return 32; }
+  if (ch == "\n") { return 10; }
+  if (ch == "\t") { return 9; }
+  if (ch == "\r") { return 13; }
+  // 字母数字与 . _ - 走 0..9 的字符比较, 避免维护整张 62 项表
+  let i = 0;
+  let digits = "0123456789";
+  while (i < 10) {
+    if (ch == substr(digits, i, 1)) { return 48 + i; }
+    i = i + 1;
+  }
+  i = 0;
+  let upper_c = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let lower_c = "abcdefghijklmnopqrstuvwxyz";
+  while (i < 26) {
+    if (ch == substr(upper_c, i, 1)) { return 65 + i; }
+    if (ch == substr(lower_c, i, 1)) { return 97 + i; }
+    i = i + 1;
+  }
+  if (ch == ".") { return 46; }
+  if (ch == "_") { return 95; }
+  if (ch == "-") { return 45; }
+  // 其余可打印 ASCII: 查表
+  i = 0;
+  while (i < len(ASCII_SAFE)) {
+    if (ch == substr(ASCII_SAFE, i, 1)) {
+      return int(get(ASCII_CODES, i, -1));
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// 文本 → 安全串
+export func esc(s: string): string {
+  let out = "";
+  let i = 0;
+  while (i < len(s)) {
+    let ch = substr(s, i, 1);
+    if (needs_esc(ch)) {
+      out = out + "~" + byte_hex(ch);
+    } else {
+      out = out + ch;
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 安全串 → 文本。遇到非法 `~` 序列原样保留(~ 本身在白名单外, 必被转义成 ~7E,
+// 所以合法串里 `~` 只可能是转义前缀)。
+export func unesc(s: string): string {
+  let out = "";
+  let i = 0;
+  while (i < len(s)) {
+    let ch = substr(s, i, 1);
+    if (ch == "~" and i + 2 < len(s) + 1 and i + 2 <= len(s) - 1) {
+      let h = substr(s, i + 1, 2);
+      let ch2 = chr_of_hex(h);
+      if (len(ch2) > 0) {
+        out = out + ch2;
+        i = i + 3;
+      } else {
+        out = out + ch;
+        i = i + 1;
+      }
+    } else {
+      out = out + ch;
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+// 两位十六进制 → 字符(只重建本层会产生的那些)
+func chr_of_hex(h: string): string {
+  if (len(h) != 2) { return ""; }
+  let a = hex_val(substr(h, 0, 1));
+  let b = hex_val(substr(h, 1, 1));
+  if (a < 0 or b < 0) { return ""; }
+  let code = a * 16 + b;
+  if (code == 32) { return " "; }
+  if (code == 10) { return "\n"; }
+  if (code == 9) { return "\t"; }
+  if (code == 13) { return "\r"; }
+  return char_of_code(code);
+}
+
+// 数值 → 单字符。只覆盖可打印 ASCII + 数字字母。
+func char_of_code(code: int): string {
+  let i = 0;
+  let digits = "0123456789";
+  while (i < 10) {
+    if (code == 48 + i) { return substr(digits, i, 1); }
+    i = i + 1;
+  }
+  i = 0;
+  let upper_c = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let lower_c = "abcdefghijklmnopqrstuvwxyz";
+  while (i < 26) {
+    if (code == 65 + i) { return substr(upper_c, i, 1); }
+    if (code == 97 + i) { return substr(lower_c, i, 1); }
+    i = i + 1;
+  }
+  i = 0;
+  while (i < len(ASCII_SAFE)) {
+    if (code == int(get(ASCII_CODES, i, -1))) {
+      return substr(ASCII_SAFE, i, 1);
+    }
+    i = i + 1;
+  }
+  // 未覆盖的值(含非 ASCII 的 3F): 统一给 '?', 与 byte_hex 的约定一致
+  return "?";
+}
+
+func hex_val(ch: string): int {
+  if (len(ch) != 1) { return -1; }
+  let i = 0;
+  while (i < 16) {
+    if (substr(HEXC, i, 1) == ch) { return i; }
+    i = i + 1;
+  }
+  // 小写十六进制也接受(手工拼帧时常见)
+  i = 0;
+  let lower_hex = "0123456789abcdef";
+  while (i < 16) {
+    if (substr(lower_hex, i, 1) == ch) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// 拆 query 串 → map。`a=1&b=2`。重复键取最后一个。
+//
+// 自己拆而不是用 req.query_params: 那个 map 已经做了一次 URL 解码, 对「~XX」
+// 这种我们自己的转义无能为力; 而且 req.path 里还带着 query 串(peer.lume
+// 文件头第 2 条), 需要原始形态来保持签名前后一致。
+export func parse_qs(qs: string) {
+  let out = {};
+  let parts = split(qs, "&");
+  let i = 0;
+  while (i < len(parts)) {
+    let kv = str(get(parts, i, ""));
+    if (len(kv) > 0) {
+      let eq = str_match("^([^=]*)=(.*)$", kv);
+      if (eq != null and len(eq) > 0) {
+        let g = get(get(eq, 0, {}), "groups", []);
+        let k = str(get(g, 0, ""));
+        let v = str(get(g, 1, ""));
+        if (len(k) > 0) { out = put(out, k, v); }
+      } else {
+        out = put(out, kv, "");
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 路径里的 query 串(`/peer/x?a=1` → `a=1`); 无则空串
+export func query_of(path: string): string {
+  let m = str_match("^[^?]*\\?(.*)$", path);
+  if (m == null or len(m) == 0) { return ""; }
+  let g = get(get(m, 0, {}), "groups", []);
+  return str(get(g, 0, ""));
+}

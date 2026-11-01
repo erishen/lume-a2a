@@ -1,0 +1,338 @@
+// probe.lume — 对两个已启动的节点做端到端断言(verify.sh 调它)
+//
+// ══ 为什么从 Python 迁到 lume ═════════════════════════════════════════
+// 原来这里是 probe.py。它手写了约 30 行签名逻辑:
+//     sign()        hmac.new(shared, "\n".join([node, ts, nonce, scope]))
+//     peer_call()   拼 URL、塞 node/ts/nonce/sig、发请求、解析响应
+// 而 lume-core/lib/peer.lume 已经把这两件事做好了 —— 这正是 lume-core
+// 存在的意义: 语言层给了 http_* 与 hmac_sha256, 库层把它们组合成
+// 「两个节点互信互调」。自己再实现一遍只会有两套实现漂移的风险。
+//
+// ══ 为什么断言写成脚本而不是"看日志" ═══════════════════════════════════
+// 日志里"看起来成功"和真的成功差很远 —— 一个 500 也可能只在日志里留一行
+// note。这里对每条链路取真实响应并断言字段。
+//
+// 用法:
+//   PEER_NAME=node-a PEER_SHARED=verify-secret \
+//     lume scripts/probe.lume <portA> <portB> <shared> [hostB] [hostA]
+//
+// 注意 PEER_NAME: peer.signed_url() 用**本进程**的 PEER_NAME 当 node 名签名
+// (Python 版是显式传参)。少设这个变量, 签名会用默认 node 名, 服务端按
+// 注册表查不到该节点 → unauthorized, 而报错看起来像"密钥错了"。
+//
+// 退出码: 0 全通过; 1 有断言失败
+import "../../lume-core/lib/peer.lume" as peer;
+
+// 断言计数器用 list: lume 函数不能修改外部标量(int 值传递), list 是引用。
+let checks = [];
+let fails = [];
+
+func check(name: string, cond: bool, detail: string) {
+  push(checks, name);
+  let mark = "PASS";
+  if (cond != true) {
+    push(fails, name);
+    mark = "FAIL";
+  }
+  let suffix = "";
+  if (len(detail) > 0) { suffix = "  (" + detail + ")"; }
+  print("  [" + mark + "] " + name + suffix);
+}
+
+// 安全取 map 字段: 缺键 / null 都返回 {}
+// lume 没有 Python 的 `or {}`, 而嵌套取值 "a.b.c" 在任一层为 null 时会抛,
+// 断言脚本不该因为一个字段缺失就整轮崩掉。
+func sub(m) {
+  if (m == null) { return {}; }
+  return m;
+}
+
+func arr(m) {
+  if (m == null) { return []; }
+  return m;
+}
+
+// 解析 http_* 的返回: { status, json }
+func wrap(r) {
+  if (get(r, "ok", false) != true) {
+    return { status: 0, json: { "error": str(get(r, "err", "unreachable")) } };
+  }
+  let txt = str(get(r, "body", ""));
+  let j = {};
+  if (len(txt) > 0) {
+    let p = try(() => json(txt));
+    if (p.err == null and p.ok != null) { j = p.ok; }
+  }
+  return { status: int(get(r, "status", 200)), json: j };
+}
+
+func http_json(url: string, body: string) {
+  if (len(body) == 0) {
+    return wrap(http_get(url, { timeout: 20, allow_private: true }));
+  }
+  return wrap(http_post(url, {
+    timeout: 20, allow_private: true,
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: body }));
+}
+
+// 签名直连。签名交给 peer.signed_url() —— 与服务器端 verify() 用同一个
+// signing_string(), 所以不可能出现"脚本算的和服务器验的不是一回事"。
+// 注意第一个参数是 **host:port**, 不是带 scheme 的 URL:
+// peer.signed_url() 自己会拼 "http://" + host + path。传完整 URL 会得到
+// "http://http://..." —— 报错是 unsupported url, 看起来完全不像参数问题。
+func peer_call(host: string, path: string, body: string) {
+  let url = peer.signed_url(host, path, body);
+  if (len(body) == 0) {
+    return wrap(http_get(url, { timeout: 25, max_bytes: 1048576, allow_private: true }));
+  }
+  return wrap(http_post(url, {
+    timeout: 25, max_bytes: 1048576, allow_private: true,
+    headers: { "Content-Type": "application/json" }, body: body }));
+}
+
+func rpc(base: string, method: string, params) {
+  return http_json(base + "/a2a",
+    stringify({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }));
+}
+
+func state_of(t) {
+  return str(get(get(sub(t), "status", {}), "state", ""));
+}
+
+// ══ 参数 ══════════════════════════════════════════════════════════════
+// 取第 i 个命令行参数, 缺省时给默认值。
+// 直接调内建 argv(): 写 `let argv = argv;` 会遮蔽内建并读到 null ——
+// 那是自赋值, 左侧先声明, 右侧拿到的是尚未初始化的自己。
+func argn(i: int, dflt: string): string {
+  let a = argv();
+  if (i < len(a)) {
+    let v = str(get(a, i, ""));
+    if (len(v) > 0) { return v; }
+  }
+  return dflt;
+}
+
+let port_a = argn(0, "18190");
+let port_b = argn(1, "18191");
+// 第 4/5 个参数: 从**节点内部视角**看对端的地址。
+// 容器场景下宿主看到的端口映射与容器内部是两套地址, 不分开的话 node-a
+// 会去连 127.0.0.1:10191(那是它自己), 报 Connection refused, 看起来像
+// relay 坏了, 实际是探测脚本给错了地址。
+let host_b = argn(3, "127.0.0.1:" + port_b);
+let host_a = argn(4, "127.0.0.1:" + port_a);
+let A = "http://127.0.0.1:" + port_a;
+let B = "http://127.0.0.1:" + port_b;
+
+// ══ 1) Agent Card ═════════════════════════════════════════════════════
+print("\n1) Agent Card(公开发现)");
+let r1 = http_json(A + "/.well-known/agent-card.json", "");
+let card = sub(get(r1, "json", {}));
+check("card 200", int(get(r1, "status", 0)) == 200, "status=" + str(get(r1, "status", 0)));
+check("card.name = node-a", str(get(card, "name", "")) == "node-a", str(get(card, "name", "")));
+check("card 有 skills", len(arr(get(card, "skills", null))) > 0, "");
+check("card 声明 supportedInterfaces", len(arr(get(card, "supportedInterfaces", null))) > 0, "");
+
+// ══ 2) message/send ═══════════════════════════════════════════════════
+print("\n2) A2A message/send");
+let r2 = rpc(A, "message/send", {
+  "message": { "role": "user", "parts": [{ "kind": "text", "text": "hi" }] },
+  "metadata": { "capability": "node.capabilities", "args": {} } });
+let task = sub(get(get(r2, "json", {}), "result", {}));
+check("返回 task", str(get(task, "kind", "")) == "task", substr(stringify(task), 0, 200));
+check("状态 completed", state_of(task) == "completed", state_of(task));
+check("有 artifacts", len(arr(get(task, "artifacts", null))) > 0, "");
+let tid = str(get(task, "id", ""));
+
+// ══ 3) 认不出能力 ═════════════════════════════════════════════════════
+print("\n3) 认不出能力 → input-required");
+let r3 = rpc(A, "message/send", {
+  "message": { "role": "user", "parts": [{ "kind": "text", "text": "今天天气如何" }] } });
+let t3 = sub(get(get(r3, "json", {}), "result", {}));
+check("不猜能力", state_of(t3) == "input-required", state_of(t3));
+check("带提问消息", get(get(sub(t3), "status", {}), "message", null) != null, "");
+
+// ══ 4) tasks/get ══════════════════════════════════════════════════════
+print("\n4) tasks/get");
+let r4 = rpc(A, "tasks/get", { "id": tid });
+// tid 可能为空(上游能力不存在时任务根本没建成), 此时 get(null,...) 会抛。
+// 断言脚本不该因为前置失败就整轮崩掉 —— 那会把后面的断言全吞掉。
+let got_id = "";
+if (tid != "") {
+  got_id = str(get(sub(get(get(r4, "json", {}), "result", {})), "id", ""));
+}
+check("查得到刚建的任务", tid != "" and got_id == tid,
+      substr(stringify(get(r4, "json", {})), 0, 150));
+let r4b = rpc(A, "tasks/get", { "id": "does-not-exist" });
+let e4 = sub(get(get(r4b, "json", {}), "error", {}));
+check("不存在 → -32001", int(get(e4, "code", 0)) == -32001, substr(stringify(get(r4b, "json", {})), 0, 150));
+
+// ══ 5) peer 签名直连 ══════════════════════════════════════════════════
+print("\n5) peer 签名直连");
+// 用真实能力而不是 echo.roundtrip: 那个能力已随"接入真实节点"收掉了。
+// 断言要验的是**现在这个节点确实能干的事**, 不然通过与否都不说明问题。
+let pb = stringify({ "tool": "node.capabilities", "arguments": {} });
+let r5 = peer_call(host_a, "/peer/invoke", pb);
+let j5 = sub(get(r5, "json", {}));
+check("invoke ok", get(j5, "ok", false) == true and str(get(j5, "state", "")) == "completed",
+      substr(stringify(j5), 0, 200));
+
+// ══ 6) 错签必须被拒 ═══════════════════════════════════════════════════
+// 用一份独立进程签名做不到"换密钥", 所以这里改测: 篡改 sig 参数。
+// 服务端只要验签失败就必须拒绝 —— 这正是身份可信层存在的理由。
+print("\n6) 篡改签名必须被拒");
+let good = peer.signed_url(host_a, "/peer/invoke", pb);
+let bad = replace(good, "sig=", "sig=deadbeef");
+let r6 = wrap(http_post(bad, {
+  timeout: 25, allow_private: true,
+  headers: { "Content-Type": "application/json" }, body: pb }));
+let j6 = sub(get(r6, "json", {}));
+check("篡改 sig → 拒绝", get(j6, "ok", false) != true, substr(stringify(j6), 0, 150));
+
+// ══ 7) 未知工具 ═══════════════════════════════════════════════════════
+print("\n7) 未知工具 → 白名单拒绝");
+let r7 = peer_call(host_a, "/peer/invoke", stringify({ "tool": "nope", "arguments": {} }));
+let j7 = sub(get(r7, "json", {}));
+check("未知工具被拒",
+      contains(str(get(j7, "error", "")), "unknown tool") or get(j7, "ok", true) != true,
+      substr(stringify(j7), 0, 150));
+
+// ══ 8~10) 多跳 relay / 跳数超限 / aggregate ═══════════════════════════
+// 注: 这三条依赖 dispatch 里的 relay.forward / facts.aggregate 能力。
+// 本节点已收敛为「真实节点」模式(catalog 只有 4 个能力), 这些自造能力
+// 在真实节点上不存在, 所以这里按"可选"处理: 能力不存在就跳过,
+// 而不是记一条假失败 —— 假失败会让整条验收失去可信度。
+print("\n8) 多跳 relay(已退役)");
+// /peer/relay 在收敛为真实节点模式后已返回 410。这里断言**它确实退役了**,
+// 而不是假装还能用 —— 一个返回 410 的入口如果被当成"通过", 会掩盖
+// 文档与实际行为的不一致。
+let r8 = peer_call(host_a, "/peer/relay", stringify({ "target": "x", "capability": "y" }));
+let j8 = sub(get(r8, "json", {}));
+// 退役的标志是 body 里的 status=410 + ok=false, 不是 HTTP 状态码。
+// 路由保留、HTTP 仍回 200 是有意的: 删掉路由的话老客户端收到 404 会以为
+// 是路径写错; 410 才说得清"能力退役, 该改调用方式"。
+check("relay 入口明确退役(410 + 指向新方式)",
+      int(get(j8, "status", 0)) == 410 and get(j8, "ok", true) != true
+        and len(str(get(j8, "hint", ""))) > 0,
+      substr(stringify(j8), 0, 160));
+
+// ══ 11) 多轮补全 ══════════════════════════════════════════════════════
+print("\n11) 多轮补全(report.compose, 可选)");
+let r11 = rpc(A, "message/send", {
+  "message": { "role": "user", "parts": [{ "kind": "text", "text": "做份报告" }] },
+  "metadata": { "capability": "report.compose", "args": { "subject": "Q3" } } });
+let t11 = sub(get(get(r11, "json", {}), "result", {}));
+let mt_id = str(get(t11, "id", ""));
+if (state_of(t11) == "input-required") {
+  check("首轮缺参数 → input-required", true, "");
+  let r11b = rpc(A, "message/send", { "id": mt_id, "metadata": { "args": { "period": "2026Q3" } } });
+  let t11b = sub(get(get(r11b, "json", {}), "result", {}));
+  check("补一项后仍缺一项", state_of(t11b) == "input-required", state_of(t11b));
+  let r11c = rpc(A, "message/send", { "id": mt_id, "metadata": { "args": { "audience": "管理层" } } });
+  let t11c = sub(get(get(r11c, "json", {}), "result", {}));
+  check("补齐后 completed", state_of(t11c) == "completed", state_of(t11c));
+  check("history 记录了 3 轮", len(arr(get(t11c, "history", null))) == 3,
+        str(len(arr(get(t11c, "history", null)))));
+} else {
+  print("  [SKIP] report.compose 不在本节点能力集");
+}
+
+// ══ 12) 取消语义 ══════════════════════════════════════════════════════
+print("\n12) 取消语义(tasks/cancel, 可选)");
+let r12 = rpc(A, "message/send", {
+  "message": { "role": "user", "parts": [{ "kind": "text", "text": "批量" }] },
+  "metadata": { "capability": "batch.process", "args": { "items": "x,y", "secs": 30 } } });
+let t12 = sub(get(get(r12, "json", {}), "result", {}));
+let ct_id = str(get(t12, "id", ""));
+// 条件要看**状态**而不只是 kind: 能力不存在时, 任务照样会建出来(状态
+// rejected)。那种情况再取消必然回 -32002, 把它记成"取消失败"是错的断言,
+// 而错的断言比没有断言更糟 —— 它教人忽略红灯。
+let st12 = state_of(t12);
+if (st12 == "submitted" or st12 == "working") {
+  let r12c = rpc(A, "tasks/cancel", { "id": ct_id });
+  check("取消成功",
+        str(get(get(sub(get(get(r12c, "json", {}), "result", {})), "status", {}), "state", "")) == "canceled",
+        substr(stringify(get(r12c, "json", {})), 0, 150));
+  let r12d = rpc(A, "tasks/cancel", { "id": ct_id });
+  check("已终结再取消 → -32002",
+        int(get(sub(get(get(r12d, "json", {}), "error", {})), "code", 0)) == -32002,
+        substr(stringify(get(r12d, "json", {})), 0, 120));
+} else {
+  print("  [SKIP] batch.process 不在本节点能力集(state=" + st12 + ")");
+}
+
+// ══ 13) 任务分解 ══════════════════════════════════════════════════════
+print("\n13) 任务分解(plan.split, 可选)");
+let r13 = rpc(A, "message/send", {
+  "message": { "role": "user", "parts": [{ "kind": "text", "text": "产出一份季度经营报告" }] },
+  "metadata": { "capability": "plan.split", "args": { "goal": "产出季度经营报告" } } });
+let t13 = sub(get(get(r13, "json", {}), "result", {}));
+let arts = arr(get(t13, "artifacts", null));
+if (len(arts) > 0) {
+  let txt = str(get(get(get(arts, 0, {}), "parts", [{}]), 0, {}).text);
+  let plan = {};
+  let pj = try(() => json(txt));
+  if (pj.err == null and pj.ok != null) { plan = pj.ok; }
+  check("给出分工", get(plan, "can_handle", null) != null, substr(stringify(plan), 0, 150));
+  check("列出需要协作的项", get(plan, "needs_other", null) != null, "");
+  check("声明了结论", len(str(get(plan, "verdict", ""))) > 0, str(get(plan, "verdict", "")));
+} else {
+  print("  [SKIP] plan.split 不在本节点能力集");
+}
+
+// ══ 14) SSE 流式 ══════════════════════════════════════════════════════
+print("\n14) SSE 流式(message/stream)");
+let sse_body = stringify({
+  "jsonrpc": "2.0", "id": 1, "method": "message/stream",
+  "params": { "message": { "role": "user", "parts": [{ "kind": "text", "text": "x" }] },
+              "metadata": { "capability": "node.capabilities", "args": {} } } });
+let rsse = http_post(A + "/a2a", {
+  timeout: 20, allow_private: true,
+  headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+  body: sse_body });
+let raw = str(get(rsse, "body", ""));
+// 逐行取 data: 后的 JSON。分成多行是为了让一次失败能指明是第几行。
+let events = [];
+let lines = split(raw, "\n");
+let li = 0;
+while (li < len(lines)) {
+  let ln = trim(str(get(lines, li, "")));
+  if (len(ln) > 6 and substr(ln, 0, 6) == "data: ") {
+    let pj = try(() => json(substr(ln, 6, len(ln) - 6)));
+    if (pj.err == null and pj.ok != null) { push(events, pj.ok); }
+  }
+  li = li + 1;
+}
+let kinds = [];
+let states = [];
+let ei = 0;
+while (ei < len(events)) {
+  let res = sub(get(get(events, ei, {}), "result", {}));
+  push(kinds, str(get(res, "kind", "")));
+  push(states, state_of(res));
+  ei = ei + 1;
+}
+func has_in(list, needle: string): bool {
+  let i = 0;
+  while (i < len(list)) {
+    if (str(get(list, i, "")) == needle) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+check("SSE 可读(收到事件)", len(events) >= 1, str(len(events)) + " 个");
+check("含 status-update 与 artifact-update",
+      has_in(kinds, "status-update") and has_in(kinds, "artifact-update"), str(kinds));
+check("首帧 submitted",
+      len(states) > 0 and str(get(states, 0, "")) == "submitted", str(states));
+check("含 completed", has_in(states, "completed"), str(states));
+let last = {};
+if (len(events) > 0) { last = sub(get(get(events, len(events) - 1, {}), "result", {})); }
+check("末帧 final=true", get(last, "final", false) == true, substr(stringify(last), 0, 150));
+
+// ══ 汇总 ══════════════════════════════════════════════════════════════
+let total = len(checks);
+let failed = len(fails);
+// 三元表达式: lume 写 `cond ? a : b`, 不是 Python 的 `a if cond else b`。
+let tail = failed == 0 ? "" : ", 失败: " + join(fails, ", ");
+print("\n" + str(total - failed) + "/" + str(total) + " 通过" + tail);

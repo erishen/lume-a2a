@@ -1,0 +1,199 @@
+// src/graph.lume — 实体索引与关系层(把"猜"换成"查")
+//
+// ══ 这一层替换掉什么 ═════════════════════════════════════════════════
+// 旧链路(src/promote.lume 之前的版本):
+//     客户 --公司名关键词--> 行业 --人工表--> 股票
+// 每一步都靠字符串猜。改个词、加个后缀, 结果就变, 而且不报错。
+//
+// 新链路:
+//     客户 --USCC--> 工商实体 --证券代码--> 上市公司 --代码--> 行情/信号
+// 每一跳都靠**稳定标识**连接。查不到就是查不到, 返回 unresolved。
+//
+// ══ 存储形态 ═════════════════════════════════════════════════════════
+// 一个 JSON 索引文件 .data/entity-index.json, 结构:
+//   {
+//     "by_code":  { "sh600519": { "code","name","uscc","industry","aliases":[] } },
+//     "by_uscc":  { "91350...": "sh600519" },
+//     "by_alias": { "贵州茅台": "sh600519", "茅台": "sh600519" }
+//   }
+// 为什么不用 SQLite: 这是一份**参考数据**(变化少、要能人工校对、要能 diff),
+// JSON 便于 review 与回滚。任务状态那种高频写入才适合落库。
+//
+// ══ aliases 的作用与边界 ═════════════════════════════════════════════
+// 允许别名, 但**别名必须显式登记**, 不做模糊匹配。
+// 例如 "茅台" → sh600519 可以登记, 因为人工确认过;
+// 但 "中科能源科技" 不会自动匹配到任何股票 —— 那需要人去确认它到底是谁。
+//
+// 这跟"做个模糊匹配器"的差别很大: 前者错了能查到是哪条别名配的,
+// 后者错了只能看到一个score。
+import "../../lume-core/lib/peer.lume" as peer;
+import "entity.lume" as ent;
+
+let index_path = ".data/entity-index.json";
+
+// ── 读写 ────────────────────────────────────────────────────────────
+export func load_index() {
+  let txt = read_file(index_path);
+  if (txt == null) {
+    return { by_code: {}, by_uscc: {}, by_alias: {}, loaded: false };
+  }
+  let r = try(() => json(txt));
+  if (r.err != null or r.ok == null) {
+    return { by_code: {}, by_uscc: {}, by_alias: {}, loaded: false };
+  }
+  let d = r.ok;
+  return {
+    by_code: get(d, "by_code", {}),
+    by_uscc: get(d, "by_uscc", {}),
+    by_alias: get(d, "by_alias", {}),
+    loaded: true,
+  };
+}
+
+func save_index(idx) {
+  mkdir(".data");
+  write_file(index_path, stringify(idx));
+  return idx;
+}
+
+// 登记一个实体。幂等: 同一个 code 重复登记会覆盖(人工校对的正常操作)。
+//
+// 为什么要校验 USCC 再存: 存进一份"看起来可信"的索引里的脏数据,
+// 比没有数据危险得多 —— 后者会被追问, 前者会被直接使用。
+export func upsert(code: string, name: string, uscc: string, industry: string, aliases) {
+  let c = ent.norm_code(code);
+  let u = upper(trim(str(uscc)));
+  if (len(c) == 0) {
+    return { ok: false, error: "证券代码为空" };
+  }
+  if (len(u) > 0 and not ent.uscc_valid(u)) {
+    // 明确拒绝, 并说明是哪一位不合法(调用方据此去查工商信息)
+    return { ok: false, error: "USCC 校验不通过: " + u + " (18 位 GB32100)" };
+  }
+  let idx = load_index();
+  let by_code = get(idx, "by_code", {});
+  let by_uscc = get(idx, "by_uscc", {});
+  let by_alias = get(idx, "by_alias", {});
+
+  let rec = {
+    code: c,
+    name: str(name),
+    uscc: u,
+    industry: str(industry),
+    aliases: aliases,
+  };
+  by_code = put(by_code, c, rec);
+  if (len(u) > 0) { by_uscc = put(by_uscc, u, c); }
+  // 名称与别名都进 alias 表(名称本身也是可查的键)
+  if (len(str(name)) > 0) { by_alias = put(by_alias, trim(str(name)), c); }
+  let i = 0;
+  while (i < len(aliases)) {
+    let a = trim(str(get(aliases, i, "")));
+    if (len(a) > 0) { by_alias = put(by_alias, a, c); }
+    i = i + 1;
+  }
+  save_index({ by_code: by_code, by_uscc: by_uscc, by_alias: by_alias });
+  return { ok: true, error: "", code: c };
+}
+
+// ── 解析 ────────────────────────────────────────────────────────────
+// 按优先级: USCC > 证券代码 > 显式别名。
+// 每一级命中都带 method, 便于解释"为什么认成同一个"。
+export func resolve(name: string, uscc: string, code: string) {
+  let idx = load_index();
+  let u = upper(trim(str(uscc)));
+  let c = ent.norm_code(code);
+  let nm = trim(str(name));
+
+  if (len(u) > 0) {
+    if (not ent.uscc_valid(u)) {
+      return { status: "invalid", method: "uscc-check", code: "", record: null,
+               reason: "USCC 校验不通过: " + u };
+    }
+    let hit = get(get(idx, "by_uscc", {}), u, "");
+    if (len(str(hit)) > 0) {
+      return { status: "matched", method: "uscc", code: str(hit),
+               record: get(get(idx, "by_code", {}), str(hit), null), reason: "" };
+    }
+    // USCC 合法但索引里没有: 可能未收录, 也可能不是上市公司 —— 如实说
+    return { status: "unresolved", method: "uscc", code: "", record: null,
+             reason: "USCC 合法但未在索引中(未收录或非上市主体)" };
+  }
+
+  if (len(c) > 0) {
+    let rec = get(get(idx, "by_code", {}), c, null);
+    if (rec != null) {
+      return { status: "matched", method: "code", code: c, record: rec, reason: "" };
+    }
+    return { status: "unresolved", method: "code", code: c, record: null,
+             reason: "证券代码未在索引中(需先 upsert 登记)" };
+  }
+
+  if (len(nm) > 0) {
+    let hit = get(get(idx, "by_alias", {}), nm, "");
+    if (len(str(hit)) > 0) {
+      return { status: "matched", method: "alias", code: str(hit),
+               record: get(get(idx, "by_code", {}), str(hit), null), reason: "" };
+    }
+    return { status: "unresolved", method: "name", code: "", record: null,
+             reason: "名称/别名未登记; 不做模糊匹配(错配代价高于漏配)" };
+  }
+
+  return { status: "invalid", method: "none", code: "",
+           record: null, reason: "未提供任何可用于识别的字段" };
+}
+
+// 一次解析多个实体(批量导入用)。返回 { matched, unresolved, invalid }
+export func resolve_many(rows) {
+  let matched = [];
+  let unresolved = [];
+  let invalid = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let r = get(rows, i, {});
+    let one = resolve(str(get(r, "name", "")), str(get(r, "uscc", "")), str(get(r, "code", "")));
+    let rec = {
+      input: r,
+      status: get(one, "status", ""),
+      method: get(one, "method", ""),
+      code: get(one, "code", ""),
+      reason: get(one, "reason", ""),
+    };
+    let st = str(get(one, "status", ""));
+    if (st == "matched") { push(matched, rec); }
+    else if (st == "invalid") { push(invalid, rec); }
+    else { push(unresolved, rec); }
+    i = i + 1;
+  }
+  return { matched: matched, unresolved: unresolved, invalid: invalid,
+           total: len(rows) };
+}
+
+// 索引统计(给页面显示"对齐覆盖了多少")
+export func stats() {
+  let idx = load_index();
+  let bc = get(idx, "by_code", {});
+  let bu = get(idx, "by_uscc", {});
+  let ba = get(idx, "by_alias", {});
+  return {
+    loaded: get(idx, "loaded", false),
+    entities: len(bc),
+    with_uscc: len(bu),
+    aliases: len(ba),
+    path: index_path,
+  };
+}
+
+// 索引里所有实体(按代码升序), 供页面展示
+export func all_entities() {
+  let idx = load_index();
+  let bc = get(idx, "by_code", {});
+  let ks = sort(keys(bc));
+  let out = [];
+  let i = 0;
+  while (i < len(ks)) {
+    push(out, get(bc, str(get(ks, i, "")), null));
+    i = i + 1;
+  }
+  return out;
+}

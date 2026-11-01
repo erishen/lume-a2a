@@ -1,0 +1,229 @@
+// src/proto_encode.lume — 帧编解码的**纯函数**部分(被 node.lume 与 tests 共用)
+//
+// 拆出来单独一个文件的原因: tests/ 要用同一个实现做往返断言。测试里复制一份
+// 逻辑是最糟的写法 —— 测试全绿, 守的却是一份已经不存在的规则。
+//
+// 已知边界(见文件内的 esc/unesc): 只保证 ASCII 保真。非 ASCII 字节统一落成
+// '?', 并用 `nz` 计数标出「这帧里有多少个非 ASCII 字符」。前端的「编码细节」
+// 面板会把这个计数显示出来 —— 与其假装无损, 不如把损失明说出来。
+let HEXC = "0123456789ABCDEF";
+
+// 安全集合: 不转义。其余一律 ~XX。
+func is_safe(ch: string): bool {
+  if (len(ch) != 1) { return false; }
+  return len(str_match("^[A-Za-z0-9._-]$", ch)) > 0;
+}
+
+// 单字符 → 码点(仅 ASCII 可打印 + 控制字符里常用的几个)。
+// 用逐段查表, 不依赖任何编码转换内建。
+func code_of(ch: string): int {
+  if (ch == " ") { return 32; }
+  if (ch == "\n") { return 10; }
+  if (ch == "\t") { return 9; }
+  if (ch == "\r") { return 13; }
+  if (ch == "~") { return 126; }
+  if (ch == "=") { return 61; }
+  if (ch == "&") { return 38; }
+  if (ch == "?") { return 63; }
+  if (ch == "#") { return 35; }
+  if (ch == "%") { return 37; }
+  if (ch == "+") { return 43; }
+  if (ch == "/") { return 47; }
+  if (ch == ":") { return 58; }
+  if (ch == ";") { return 59; }
+  if (ch == ",") { return 44; }
+  if (ch == "(") { return 40; }
+  if (ch == ")") { return 41; }
+  if (ch == "[") { return 91; }
+  if (ch == "]") { return 93; }
+  if (ch == "{") { return 123; }
+  if (ch == "}") { return 125; }
+  if (ch == "!") { return 33; }
+  if (ch == "*") { return 42; }
+  if (ch == "'") { return 39; }
+  if (ch == "\"") { return 34; }
+  if (ch == "@") { return 64; }
+  if (ch == "$") { return 36; }
+  if (ch == "^") { return 94; }
+  if (ch == "|") { return 124; }
+  if (ch == "\\") { return 92; }
+  if (ch == "<") { return 60; }
+  if (ch == ">") { return 62; }
+  if (ch == "`") { return 96; }
+  if (ch == ".") { return 46; }
+  if (ch == "_") { return 95; }
+  if (ch == "-") { return 45; }
+  let d = "0123456789";
+  let i = 0;
+  while (i < 10) {
+    if (ch == substr(d, i, 1)) { return 48 + i; }
+    i = i + 1;
+  }
+  let u = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let l = "abcdefghijklmnopqrstuvwxyz";
+  i = 0;
+  while (i < 26) {
+    if (ch == substr(u, i, 1)) { return 65 + i; }
+    if (ch == substr(l, i, 1)) { return 97 + i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+func chr_of(code: int): string {
+  if (code == 32) { return " "; }
+  if (code == 10) { return "\n"; }
+  if (code == 9) { return "\t"; }
+  if (code == 13) { return "\r"; }
+  if (code == 126) { return "~"; }
+  if (code == 61) { return "="; }
+  if (code == 38) { return "&"; }
+  if (code == 63) { return "?"; }
+  if (code == 35) { return "#"; }
+  if (code == 37) { return "%"; }
+  if (code == 43) { return "+"; }
+  if (code == 47) { return "/"; }
+  if (code == 58) { return ":"; }
+  if (code == 59) { return ";"; }
+  if (code == 44) { return ","; }
+  if (code == 40) { return "("; }
+  if (code == 41) { return ")"; }
+  if (code == 91) { return "["; }
+  if (code == 93) { return "]"; }
+  if (code == 123) { return "{"; }
+  if (code == 125) { return "}"; }
+  if (code == 33) { return "!"; }
+  if (code == 42) { return "*"; }
+  if (code == 39) { return "'"; }
+  if (code == 34) { return "\""; }
+  if (code == 64) { return "@"; }
+  if (code == 36) { return "$"; }
+  if (code == 94) { return "^"; }
+  if (code == 124) { return "|"; }
+  if (code == 92) { return "\\"; }
+  if (code == 60) { return "<"; }
+  if (code == 62) { return ">"; }
+  if (code == 96) { return "`"; }
+  if (code == 46) { return "."; }
+  if (code == 95) { return "_"; }
+  if (code == 45) { return "-"; }
+  let d = "0123456789";
+  let i = 0;
+  while (i < 10) {
+    if (code == 48 + i) { return substr(d, i, 1); }
+    i = i + 1;
+  }
+  let u = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let l = "abcdefghijklmnopqrstuvwxyz";
+  i = 0;
+  while (i < 26) {
+    if (code == 65 + i) { return substr(u, i, 1); }
+    if (code == 97 + i) { return substr(l, i, 1); }
+    i = i + 1;
+  }
+  return "?";
+}
+
+// 编码。第二返回值语义由调用方用 count_unsafe 单独取(见下)。
+export func esc(s: string): string {
+  let out = "";
+  let i = 0;
+  while (i < len(s)) {
+    let ch = substr(s, i, 1);
+    if (is_safe(ch)) {
+      out = out + ch;
+    } else {
+      let c = code_of(ch);
+      if (c < 0) {
+        out = out + "~3F";     // 非 ASCII: 明确落成 '?'
+      } else {
+        out = out + "~" + substr(HEXC, floor(c / 16), 1) + substr(HEXC, c % 16, 1);
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 这一帧里有多少个「非 ASCII 字符」(按 lume 的字节长度粗算, 只用于提示)
+export func count_unsafe(s: string): int {
+  let n = 0;
+  let i = 0;
+  while (i < len(s)) {
+    if (code_of(substr(s, i, 1)) < 0) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+export func unesc(s: string): string {
+  let out = "";
+  let i = 0;
+  while (i < len(s)) {
+    let ch = substr(s, i, 1);
+    if (ch == "~" and i + 2 < len(s) + 1) {
+      let h = substr(s, i + 1, 2);
+      let v = hex2(h);
+      if (v >= 0) {
+        out = out + chr_of(v);
+        i = i + 3;
+        continue;
+      }
+    }
+    out = out + ch;
+    i = i + 1;
+  }
+  return out;
+}
+
+func hex2(h: string): int {
+  if (len(h) != 2) { return -1; }
+  let a = hex1(substr(h, 0, 1));
+  let b = hex1(substr(h, 1, 1));
+  if (a < 0 or b < 0) { return -1; }
+  return a * 16 + b;
+}
+
+func hex1(ch: string): int {
+  if (len(ch) != 1) { return -1; }
+  let i = 0;
+  while (i < 16) {
+    if (substr(HEXC, i, 1) == ch) { return i; }
+    if (substr("0123456789abcdef", i, 1) == ch) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// `a=1&b=2` → map。自己拆而不用 req.query_params: 那个已经做过一次 URL 解码,
+// 而我们的 ~XX 是自己的转义, 需要拿到原始形态。
+export func parse_qs(qs: string) {
+  let out = {};
+  if (len(qs) == 0) { return out; }
+  let parts = split(qs, "&");
+  let i = 0;
+  while (i < len(parts)) {
+    let kv = str(get(parts, i, ""));
+    if (len(kv) > 0) {
+      let eq = str_match("^([^=]*)=(.*)$", kv);
+      if (eq != null and len(eq) > 0) {
+        let g = get(get(eq, 0, {}), "groups", []);
+        let k = str(get(g, 0, ""));
+        let v = str(get(g, 1, ""));
+        if (len(k) > 0) { out = put(out, k, v); }
+      } else {
+        out = put(out, kv, "");
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 路径的 query 部分(`/p?a=1` → `a=1`)
+export func query_of(path: string): string {
+  let m = str_match("^[^?]*\\?(.*)$", path);
+  if (m == null or len(m) == 0) { return ""; }
+  let g = get(get(m, 0, {}), "groups", []);
+  return str(get(g, 0, ""));
+}

@@ -1,0 +1,144 @@
+// src/outreach.lume — 客户经营: 今天该联系哪个行业的客户, 由头是什么
+//
+// ══ 和之前那版的区别(这是本次改动的重点) ══════════════════════════
+// 之前: 客户行业 × 当日有信号的个股 → "该推哪只票"
+//       主体是股票, 落到"买什么"。这是荐股, 合规压力大。
+//
+// 现在: 行业整体动向 × 该行业在跟进中的客户 → "今天该联系谁、由头是什么"
+//       主体是客户, 落到"什么时候联系"。**不出现任何个股买卖建议**。
+//
+// 为什么这个反转重要:
+//   销售真正卡住的往往不是"不知道该推什么票", 而是"手上几十个客户,
+//   今天该主动联系谁"。而"这个行业最近不平静"是一个很好的搭话由头,
+//   比"该买茅台"安全得多, 也更有用 —— 它把决定权留给销售和客户。
+//
+// ══ 边界 ═══════════════════════════════════════════════════════════
+// 1. 输出只到行业, 不下探个股。页面与接口都不返回任何证券代码。
+// 2. 由头只描述现象("该行业多数上涨"), 不说"值得买入"。
+// 3. 样本不足时明确标注 —— 用 1 只标的代表一个行业是危险的,
+//    会让人误以为看到了"行业趋势"。
+import "fleet.lume" as fleet;
+import "sector.lume" as sector;
+
+// 一个行业至少要有几只标的, 它的"画像"才值得当由头。
+// 这是业务判断: 1 只标的的涨跌是个股现象, 不是行业现象。
+func min_sample(): int {
+  let v = env("OUTREACH_MIN_SAMPLE");
+  if (v == null or len(str(v)) == 0) { return 2; }
+  return int(v);
+}
+
+// 主流程: 行业动向 × 客户覆盖 → 联系清单
+export func plan() {
+  let secs = sector.scan();
+  let inds = fleet.invoke("crm", "crm.industries", 20);
+  if (!get(inds, "ok", false)) {
+    return { ok: false, error: "crm 不可用: " + str(get(inds, "error", "")) };
+  }
+  let ind_rows = get(get(inds, "result", {}), "industries", []);
+
+  let items = [];
+  let skipped = [];
+  let i = 0;
+  while (i < len(secs)) {
+    let s = get(secs, i, {});
+    let name = str(get(s, "industry", ""));
+    let reach = 0;
+    let j = 0;
+    while (j < len(ind_rows)) {
+      let r = get(ind_rows, j, {});
+      if (str(get(r, "industry", "")) == name) { reach = int(get(r, "customers", 0)); }
+      j = j + 1;
+    }
+    if (reach == 0) {
+      // 没有该行业客户: 不是"值得联系", 是"没人可联系"
+      push(skipped, { industry: name, reason: "该行业当前没有在跟进中的客户" });
+    } else if (int(get(s, "count", 0)) < min_sample()) {
+      // 样本太薄: 不适合当由头, 明说原因而不是悄悄保留
+      push(skipped, { industry: name,
+                      reason: "该行业仅 " + str(get(s, "count", 0)) +
+                              " 只标的在索引中, 不足 " + str(min_sample()) +
+                              " 只, 不足以代表行业动向" });
+    } else {
+      push(items, {
+        industry: name,
+        customers: reach,
+        sample_size: int(get(s, "count", 0)),
+        headline: str(get(s, "headline", "")),
+        avg_change: get(s, "avg_change", 0),
+        has_momentum: get(s, "has_momentum", false),
+        avg_momentum: get(s, "avg_momentum", 0),
+        // 由头: 只说现象 + 为什么今天值得聊
+        hook: hook_of(name, s, reach),
+      });
+    }
+    i = i + 1;
+  }
+
+  return {
+    ok: true,
+    // 排序: 客户多的优先(值得联系的人多), 再看动静大小
+    items: sort_items(items),
+    skipped: skipped,
+    // 覆盖率: 多少行业能形成可用的联系由头。低就是低, 不修饰。
+    coverage: {
+      industries_total: len(secs),
+      with_contact: len(items),
+      skipped: len(skipped),
+      min_sample: min_sample(),
+    },
+    boundary: "只到行业级别, 不包含任何个股代码或买卖建议",
+  };
+}
+
+// 由头: 句子里不能出现"买/卖/推荐/机会"。
+func hook_of(industry: string, s, reach: int): string {
+  let n = int(get(s, "count", 0));
+  let chg = float(get(s, "avg_change", 0.0));
+  let dir = "波动";
+  if (chg > 1) { dir = "整体走强"; }
+  else if (chg < -1) { dir = "整体走弱"; }
+  return "[" + industry + "] 今日 " + dir + "(" + str(chg) + "%), 涉及 " +
+         str(n) + " 只标的; 该行业当前有 " + str(reach) +
+         " 个客户在跟进中, 可作为主动联系的由头";
+}
+
+// 排序: 客户数优先, 其次波动幅度。
+// 为什么客户数优先: 目标是"客户经营", 不是"哪个行业最热"。
+// 一个只有 1 个客户的行业再热, 也只影响一个人。
+func sort_items(list) {
+  let a = [];
+  let i = 0;
+  while (i < len(list)) {
+    let x = get(list, i, {});
+    let kx = key_of(x);
+    let pos = 0;
+    let placed = false;
+    while (pos < len(a) and not placed) {
+      if (key_of(get(a, pos, {})) < kx) {
+        a = insert_at(a, pos, x);
+        placed = true;
+      }
+      pos = pos + 1;
+    }
+    if (not placed) { push(a, x); }
+    i = i + 1;
+  }
+  return a;
+}
+
+func key_of(x): float {
+  let c = float(get(x, "customers", 0));
+  let ch = float(get(x, "avg_change", 0.0));
+  if (ch < 0) { ch = 0 - ch; }
+  return c * 1000 + ch;
+}
+
+func insert_at(a, pos: int, v) {
+  let out = [];
+  let i = 0;
+  while (i < pos) { push(out, get(a, i, null)); i = i + 1; }
+  push(out, v);
+  while (i < len(a)) { push(out, get(a, i, null)); i = i + 1; }
+  return out;
+}

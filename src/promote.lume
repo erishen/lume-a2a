@@ -1,0 +1,307 @@
+// src/promote.lume — 业务场景: 用 CRM 客户画像, 挑 scanner 里值得推的 A 股标的
+//
+// ══ 这个场景要解决什么 ══════════════════════════════════════════════
+// crm 知道"我们有哪些行业的客户", scanner 知道"哪些股票今天在放信号"。
+// 两个系统各自都对, 但**谁也不知道该把哪只票推给哪类客户** ——
+// 因为这份知识跨在两个系统的数据之上。
+//
+// 这就是 A2A 真正有用的地方: 不是"调个接口", 而是让一个节点在
+// **不复制另一个节点数据**的前提下, 拿两边的事实做一次联合判断。
+//
+// ══ 关联逻辑(按选定的方向: 行业/板块) ═════════════════════════════
+//   客户 → 行业(crm 侧自己汇总, 见 crm.industries)
+//        → 该行业下的 A 股标的(映射表 src/industry.lume)
+//        → 与 scanner 当日 picks 求交(只推"今天真在放信号"的)
+//        → 按信号强度排序, 给出可反驳的推荐理由
+//
+// ══ 关键约束: 拿不到客户明细, 也不该拿 ═════════════════════════════
+// crm 的 peer 面**故意不转发**客户姓名/邮箱/电话(那是个人数据, 见
+// lume-crm/peer_node.lume 里 /peer/info 的注释)。所以这里走 crm.industries ——
+// crm 自己按公司名归行业, 只交出 [{"industry":"金融","customers":1}]。
+//
+// 这个约束让场景更真实而不是更难做: 真实的跨部门数据协作本来就不该
+// 把明细搬来搬去。判定"哪类客户该推哪只票"根本不需要知道客户叫什么。
+//
+// ══ 三个刻意的取舍 ═════════════════════════════════════════════════
+// 1. **认不出的行业就说认不出**, 不拿"热点板块"兜底。把制造类客户推进白酒股,
+//    在推荐场景里是灾难性的 —— 而且没人会去核对。
+// 2. **只推 scanner 今天选中的**, 不做"该行业所有股票"的全量罗列。
+//    全量列表看起来更充实, 但它不是"信号", 推了等于没推。
+// 3. **把没匹配上的也列出来并给出覆盖率**。只展示成功案例会让人误以为
+//    链路很健康; 覆盖率才是这条链路最该盯的指标。
+import "fleet.lume" as fleet;
+import "industry.lume" as ind;
+import "graph.lume" as graph;
+import "entity.lume" as ent;
+
+// 客户行业分布(来自 crm, 只有聚合数字)
+func customer_industries() {
+  let r = fleet.invoke("crm", "crm.industries", 20);
+  if (!get(r, "ok", false)) {
+    return { ok: false, list: [], total: 0, unclassified: 0,
+             error: str(get(r, "error", "crm 调用失败")) };
+  }
+  let res = get(r, "result", null);
+  if (res == null) {
+    return { ok: false, list: [], total: 0, unclassified: 0, error: "crm.industries 返回空" };
+  }
+  return {
+    ok: true,
+    list: get(res, "industries", []),
+    total: int(get(res, "customer_count", 0)),
+    unclassified: int(get(res, "unclassified", 0)),
+    error: "",
+  };
+}
+
+// scanner 当日 picks
+func picks() {
+  let r = fleet.invoke("scanner", "scanner.picks", 25);
+  if (!get(r, "ok", false)) {
+    return { ok: false, list: [], date: "", error: str(get(r, "error", "scanner 调用失败")) };
+  }
+  let res = get(r, "result", null);
+  if (res == null) {
+    return { ok: false, list: [], date: "", error: "scanner.picks 返回空" };
+  }
+  return { ok: true, list: get(res, "picks", []), date: str(get(res, "date", "")), error: "" };
+}
+
+// 主流程: 客户行业 × 当日信号 求交
+export func recommend() {
+  let ci = customer_industries();
+  let pk = picks();
+  let trace = [];
+  push(trace, { node: "crm", at: int(now()),
+                note: ok_note(get(ci, "ok", false), "取客户行业分布", get(ci, "error", "")) });
+  push(trace, { node: "scanner", at: int(now()),
+                note: ok_note(get(pk, "ok", false),
+                              "取当日选股(" + str(get(pk, "date", "")) + ")", get(pk, "error", "")) });
+
+  // 当日 picks 按 code 建索引
+  let by_code = {};
+  let plist = get(pk, "list", []);
+  let i = 0;
+  while (i < len(plist)) {
+    let p = get(plist, i, {});
+    by_code = put(by_code, str(get(p, "code", "")), p);
+    i = i + 1;
+  }
+
+  let recs = [];
+  let no_signal = [];
+  let ilist = get(ci, "list", []);
+  let j = 0;
+  while (j < len(ilist)) {
+    let it = get(ilist, j, {});
+    let ind_code = str(get(it, "industry", ""));
+    let n_cust = int(get(it, "customers", 0));
+    let cands = ind.stocks_in(ind_code);
+    // 该行业下, 今日真在放信号的标的
+    // 该行业的全部潜在标的, 每只标 "今天有没有信号"。
+    //
+    // 为什么两种都返回而不是只返回有信号的: 当日 8 只 picks 往往只覆盖少数行业,
+    // 只返回有信号的会让大多数客户行业显示为空 —— 而那不代表"这些行业不值得看",
+    // 只代表"今天没轮到它"。把潜在标的也列出来, 更像真实的销售工作台账。
+    //
+    // 但**必须逐只标出 signaled**, 否则它就退化成一张普通股票列表,
+    // 用户会以为每只都该推 —— 那是另一类错误。
+    let hit = [];
+    let k = 0;
+    while (k < len(cands)) {
+      let cd = get(cands, k, {});
+      let picked = get(by_code, str(get(cd, "code", "")), null);
+      let has = picked != null;
+      push(hit, {
+        code: str(get(cd, "code", "")),
+        name: str(get(cd, "name", "")),
+        industry: ind_code,
+        signaled: has,
+        score: has ? get(picked, "score", 0) : 0,
+        change: has ? get(picked, "change", 0) : 0,
+        signals: has ? get(picked, "signals", []) : [],
+      });
+      k = k + 1;
+    }
+    let n_sig = count_signaled(hit);
+    if (len(hit) == 0) {
+      // 映射表里也没有这个行业: 明说"暂无标的", 而不是假装行业有问题
+      push(no_signal, {
+        industry: ind_code,
+        customers: n_cust,
+        reason: "映射表中该行业暂无标的(见 src/industry.lume)",
+      });
+    } else {
+      push(recs, {
+        industry: ind_code,
+        customers: n_cust,
+        // 依据可靠度: 这行的行业是"查出来的"还是"猜出来的"。
+        // exact = 该行业下至少一只标的能经实体索引按证券代码/别名确认;
+        // keyword = 全部来自公司名关键词规则。
+        // 不标这个, 使用者会把两者当成同等可信 —— 而它们差了一个数量级。
+        basis: basis_of(hit),
+        signal_count: n_sig,
+        target_count: len(hit),
+        // 有信号的排前面(strongest_first 已把 signaled=false 的 score 记为 0)
+        targets: strongest_first(hit),
+        reason: "有 " + str(n_cust) + " 个客户属于" + ind_code + "; 该行业 " +
+                str(len(hit)) + " 只潜在标的中, 今日 " + str(n_sig) + " 只有信号",
+      });
+    }
+    j = j + 1;
+  }
+
+  // 客户侧对齐度：需要公司名，从 crm 的行业分布里拿不到名字，
+  // 所以单独调一次 crm.stats 取（只有公司名，不含联系方式）
+  let body = {
+    as_of: str(get(pk, "date", "")),
+    // 覆盖率: 这个场景最该盯的数字。只看成功案例会误以为链路很健康。
+    coverage: {
+      customers: get(ci, "total", 0),
+      customer_industries: len(ilist),
+      industries_covered: len(recs),
+      industries_not_in_map: len(no_signal),
+      unclassified_customers: get(ci, "unclassified", 0),
+    },
+    recommendations: sort_by_customers(recs),
+    not_in_map: no_signal,
+    trace: trace,
+    // 数据来源要说清, 尤其哪部分是人工映射
+    sources: {
+      customers: "crm.industries(crm 侧自汇总, 不含客户明细)",
+      picks: "scanner.picks",
+      industry_map: "人工维护映射表 src/industry.lume, 非上游字段",
+    },
+  };
+  return { ok: true, body: body };
+}
+
+// 该行业标的里, 今日有信号的数量
+func count_signaled(list) {
+  let n = 0;
+  let i = 0;
+  while (i < len(list)) {
+    if (get(get(list, i, {}), "signaled", false) == true) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+func ok_note(ok: bool, ok_msg: string, err: string): string {
+  if (ok) { return ok_msg; }
+  return ok_msg + " 失败: " + err;
+}
+
+// 信号强度降序
+func strongest_first(list) {
+  return sort_num_desc(list, "score");
+}
+
+// 客户数降序: 客户多的行业优先推
+func sort_by_customers(list) {
+  return sort_num_desc(list, "customers");
+}
+
+// 按某个数值字段降序。sort() 只排同类列表, 这里手写插入排序(数据量很小)。
+func sort_num_desc(list, key: string) {
+  let a = [];
+  let i = 0;
+  while (i < len(list)) {
+    let t = get(list, i, {});
+    let v = float(get(t, key, 0));
+    let pos = 0;
+    let placed = false;
+    while (pos < len(a) and not placed) {
+      if (float(get(get(a, pos, {}), key, 0)) < v) {
+        a = insert_at(a, pos, t);
+        placed = true;
+      }
+      pos = pos + 1;
+    }
+    if (not placed) { push(a, t); }
+    i = i + 1;
+  }
+  return a;
+}
+
+func insert_at(a, pos: int, v) {
+  let out = [];
+  let i = 0;
+  while (i < pos) { push(out, get(a, i, null)); i = i + 1; }
+  push(out, v);
+  while (i < len(a)) { push(out, get(a, i, null)); i = i + 1; }
+  return out;
+}
+
+// ── 依据可靠度 ──────────────────────────────────────────────────────
+// 判定一个行业结论是"查出来的"还是"猜出来的"。
+//
+// 为什么必须区分: 实体索引里有的标的, 是经过 USCC 校验的;
+// 而行业若只来自公司名关键词("中科能源科技" → 电力设备), 那是一个猜测。
+// 把两者混在一起展示, 等于让使用者以为所有结论都有同等依据 ——
+// 这是推荐系统里最危险的一种诚实问题: 不是错, 是让人高估准确率。
+func basis_of(hit) {
+  let exact = 0;
+  let i = 0;
+  while (i < len(hit)) {
+    let c = get(hit, i, {});
+    // 只统计"当日有信号"的标的: 它们才是真正参与推荐的那些。
+    // 拿整个行业的候选池去算, 会因为这个行业还有很多没录入索引的股票
+    // 而永远得到 mixed —— 那是覆盖率问题, 不是推荐依据问题。
+    if (get(c, "signaled", false) == true) {
+      let r = graph.resolve("", "", str(get(c, "code", "")));
+      if (str(get(r, "status", "")) == "matched") { exact = exact + 1; }
+    }
+    i = i + 1;
+  }
+  let signaled = count_signaled(hit);
+  if (signaled == 0) { return "keyword"; }
+  if (exact == signaled) { return "exact"; }
+  if (exact > 0) { return "mixed"; }
+  return "keyword";
+}
+
+// ── 标的侧对齐度 ────────────────────────────────────────────────────
+// 拿**股票代码**去实体索引里查, 统计有多少只能被确认为真实工商主体。
+//
+// 为什么不是"客户侧": crm 的 peer 面刻意不提供客户名单(那能反推出是谁的
+// 客户), 所以这里不能拿客户名逐个去查。改成从标的侧统计 —— 同样能回答
+// "这条链路的实体基础有多扎实", 且不越界。
+//
+// 顺带说明一个现实: 客户公司名(无论是虚构的演示公司还是真实客户)与
+// 上市公司之间, 只有拿到 USCC 才能真正对齐。这在 crm 侧是缺字段,
+// 不是本层能解决的 —— 所以下面的 coverage 低是真实状态。
+export func alignment_report(companies) {
+  let rows = [];
+  let i = 0;
+  while (i < len(companies)) {
+    let c = str(get(companies, i, ""));
+    let r = graph.resolve(c, "", "");
+    push(rows, {
+      company: c,
+      status: get(r, "status", ""),
+      method: get(r, "method", ""),
+      code: get(r, "code", ""),
+      reason: get(r, "reason", ""),
+    });
+    i = i + 1;
+  }
+  let matched = 0;
+  let invalid = 0;
+  let j = 0;
+  while (j < len(rows)) {
+    let st = str(get(get(rows, j, {}), "status", ""));
+    if (st == "matched") { matched = matched + 1; }
+    if (st == "invalid") { invalid = invalid + 1; }
+    j = j + 1;
+  }
+  return {
+    total: len(rows),
+    matched: matched,
+    unresolved: len(rows) - matched - invalid,
+    invalid: invalid,
+    // 对齐率: 有多少客户能被认成真实的上市公司实体
+    coverage: len(rows) > 0 ? float(matched) / float(len(rows)) : 0.0,
+    rows: rows,
+  };
+}
