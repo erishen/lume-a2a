@@ -18,7 +18,7 @@ services:
     build:
       context: .
       args:
-        LUME_VERSION: "${LUME_VERSION:-v0.11.0}"
+        LUME_VERSION: "${LUME_VERSION:-v0.12.1}"
     image: lume-a2a
     container_name: lume-a2a
     restart: unless-stopped

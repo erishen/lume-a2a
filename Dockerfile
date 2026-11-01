@@ -31,7 +31,7 @@
 #
 # 前端: www/ 是仓库里 build 好的 bundle, 直接 COPY, 镜像里不装 node/esbuild。
 # 二进制: 优先用宿主预下载的静态包(vendor/), 绕开容器内 curl 走网关被截断的问题。
-ARG LUME_VERSION=v0.12.0
+ARG LUME_VERSION=v0.12.1
 ARG LUME_REPO=erishen/lume
 FROM alpine:3.20
 
