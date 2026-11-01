@@ -19,6 +19,34 @@
 | `crm` | [lume-crm](https://github.com/erishen/lume-crm) | `crm.stats`（客户/商机/管道金额）、`crm.pipeline`（阶段分布） |
 | `scanner` | [lume-scanner](https://github.com/erishen/lume-scanner) | `scanner.meta`、`scanner.signals`（信号共振）、`scanner.picks`（选股） |
 
+## 跑起来需要什么
+
+Docker 一条命令（`make docker-up`）只需要本机和 `.env`，不用先 clone 别的仓库 ——
+`lume` 二进制与 `lume-core/lib` 都按版本从 GitHub release 取。
+
+**但本地开发（`make dev` / `make check`）需要同级目录**，因为源码里写的是相对
+import（`../lume-core/lib/peer.lume`），而 `Makefile` 的 `LUME` 默认取
+`../lume/bin/lume`：
+
+```
+work/lume/
+├── lume/          # 语言与运行时（提供 bin/lume）
+├── lume-core/     # lib/peer.lume 等共享模块
+├── lume-crm/      # 被调用的真实节点（peer 端口 18102）
+├── lume-scanner/  # 被调用的真实节点（peer 端口 18103）
+└── lume-a2a/      # 本项目
+```
+
+```bash
+git clone https://github.com/erishen/lume        ../lume
+git clone https://github.com/erishen/lume-core   ../lume-core
+git clone https://github.com/erishen/lume-crm    ../lume-crm
+git clone https://github.com/erishen/lume-scanner ../lume-scanner
+```
+
+少任何一个，`make check` 会报 `cannot resolve import` 或找不到 `bin/lume` ——
+那是在告诉你缺目录，不是代码坏了。
+
 ## 这个项目干什么
 
 **今天该联系哪个行业的客户，由头是什么。**
