@@ -183,7 +183,6 @@ export function NegotiatePanel(): React.ReactElement {
           <div className="plan-main">
             <div>
               <div className="plan-name">{String(view.plan.name)}</div>
-              <div className="mono hint">{String(view.plan.code)}</div>
             </div>
             <div className="plan-metrics">
               <div><b>{String(view.plan.score)}</b><span>信号评分</span></div>

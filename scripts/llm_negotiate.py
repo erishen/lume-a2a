@@ -530,6 +530,20 @@ def negotiate(env: dict, llm: LLM, max_rounds: int = 3, verbose: bool = True) ->
     }
 
 
+def strip_codes(obj):
+    """对外输出不含证券代码(合规)。
+
+    协商内部用 code 做标识(verify_proposal 核对 / 去重), 但快照是给控制台
+    读的 —— 输出只到"标的名称 + 理由"。递归删除所有 key=="code" 的字段,
+    保留 code_reason(否决原因码, 不是证券代码)。
+    """
+    if isinstance(obj, dict):
+        return {k: strip_codes(v) for k, v in obj.items() if k != "code"}
+    if isinstance(obj, list):
+        return [strip_codes(x) for x in obj]
+    return obj
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true", help="只输出 JSON")
@@ -560,12 +574,14 @@ def main() -> int:
         result["generated_at"] = int(time.time())
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 写快照前清洗: 快照是给控制台/客户端读的, 不含证券代码(合规)。
+        out.write_text(json.dumps(strip_codes(result), ensure_ascii=False, indent=2),
+                       encoding="utf-8")
         if not args.json:
             print(f"\n快照已写入: {out}")
 
     if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(strip_codes(result), ensure_ascii=False, indent=2))
     else:
         for r in result.get("rounds", []):
             role = "选股侧" if r["role"] == "scanner" else "客户侧"

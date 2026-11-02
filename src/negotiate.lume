@@ -370,14 +370,16 @@ export func negotiate(goal: string) {
     }
   }
 
-  return {
+  // 对外输出不含证券代码(合规边界)。协商逻辑内部用 code 做标识与匹配,
+  // 但这是给控制台/客户端看的结果 —— 展示只到"标的名称 + 理由", 不给代码。
+  return strip_code({
     goal: goal,
     rounds: rounds,
     round_count: round,
     converged: accepted != null,
     plan: accepted,
     verdict: conclusion(accepted, round, avoid),
-  };
+  });
 }
 
 // 把一个否决理由翻译成"下一轮该怎么提"。
@@ -417,4 +419,36 @@ func conclusion(accepted, round: int, avoid) {
   }
   return "第 " + str(round) + " 轮达成一致: 客户侧否决了 " + str(nv) +
          " 个候选后, " + str(get(accepted, "name", "")) + " 通过";
+}
+
+// ── 对外输出清洗(合规) ──────────────────────────────────────────────
+// 协商逻辑内部用证券代码做标识(avoid 去重 / graph.resolve 匹配), 但
+// 演示给客户端看的结果只到"标的名称 + 理由"。递归删除所有 key=="code"
+// 的字段; **保留 code_reason**(那是否决原因码, 如 NO_SIGNAL, 不是证券代码)。
+//
+// 这是"看起来像荐股工具"的最后一道防线: 一旦输出里出现证券代码,
+// 这一页就从"验证协商机制"变回"推荐某只票"。
+//
+// 类型判断用 stringify: 它给字符串加引号(实测 `"{hello}"` 不以 `{` 开头),
+// 所以 map/array 的判断不会误伤字符串值。
+func strip_code(v) {
+  let s = stringify(v);
+  if (len(str_match("^\\{", s)) > 0) {
+    let out = {};
+    let ks = keys(v);
+    let i = 0;
+    while (i < len(ks)) {
+      let k = str(get(ks, i, ""));
+      if (k != "code") { out = put(out, k, strip_code(get(v, k, null))); }
+      i = i + 1;
+    }
+    return out;
+  }
+  if (len(str_match("^\\[", s)) > 0) {
+    let out = [];
+    let i = 0;
+    while (i < len(v)) { push(out, strip_code(get(v, i, null))); i = i + 1; }
+    return out;
+  }
+  return v;
 }

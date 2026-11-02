@@ -206,7 +206,6 @@ export interface NegotiationRound {
   round: number;
   role: "scanner" | "crm";
   action: "propose" | "reject" | "accept" | "exhausted" | "blocked";
-  code?: string;
   name?: string;
   industry?: string;
   /** 否决原因码，让理由可归类、可统计 */
@@ -215,7 +214,7 @@ export interface NegotiationRound {
 }
 
 export interface NegotiationPlan {
-  code: string;
+  /** 只展示标的名称与指标 —— **不含证券代码**(合规: 见 strip_code)。 */
   name: string;
   score: number;
   change: number;
