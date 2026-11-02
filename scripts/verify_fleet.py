@@ -255,10 +255,16 @@ def main() -> int:
     app_tsx = (root / "src" / "ui" / "App.tsx").read_text(encoding="utf-8")
     check("页面有常驻合规提示", "disclaimer" in app_tsx and "不构成投资建议" in app_tsx,
           "App.tsx 中未找到 disclaimer 提示")
+    # README 已双语(英文主版 + 中文版)。免责声明是产品性质的锚,
+    # 两种语言都必须保留 —— 否则某一版被删, 又会出现"看起来像荐股工具"。
     readme = (root / "README.md").read_text(encoding="utf-8")
-    check("README 顶部声明技术演示",
-          "技术演示" in readme[:800] and "不构成任何投资建议" in readme,
-          "README 顶部缺少免责声明")
+    check("README 顶部声明技术演示(英文)",
+          "Technical demo" in readme[:800] and "Not investment advice" in readme,
+          "README.md 顶部缺少免责声明")
+    readme_zh = (root / "README.zh.md").read_text(encoding="utf-8")
+    check("README 中文版声明技术演示",
+          "技术演示" in readme_zh[:800] and "不构成任何投资建议" in readme_zh,
+          "README.zh.md 顶部缺少免责声明")
     # 提示词里也要有语境边界, 否则模型会自称在给客户建议
     for f in ("agent_crm.md", "agent_scanner.md"):
         t = (root / "prompts" / f).read_text(encoding="utf-8")
