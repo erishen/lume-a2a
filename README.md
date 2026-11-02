@@ -1,40 +1,48 @@
-# lume-a2a — 跨项目的 A2A peer 通讯演示
+# lume-a2a — Cross-project A2A peer communication demo
 
-> ## ⚠️ 技术演示，不是投资工具
->
-> 本项目**只用于验证 A2A 协议与多智能体协商机制**，全部数据为演示数据。
->
-> 演示里出现的「具体证券 + 特定客户群 + 推荐理由」这个组合，正是**证券投资咨询业务**
-> 的核心特征。面向客户提供个股建议在境内须持牌经营。
->
-> - **不构成任何投资建议**，不得用于向真实客户提供买卖指引
-> - 若要产品化，需要：投顾牌照、投资者适当性匹配、留痕与回溯、数据源授权
-> - 页面顶部有常驻提示，不可关闭——**截图传出去时提示必须还在**
+> **English** | [中文](README.zh.md)
 
-用 **lume**(服务端) + **lume-core**(语言与 `lib/peer.lume`) + **React** 搭的控制台，
-**直接调用两个真实运行的 lume 应用**：
+> ## ⚠️ Technical demo, not an investment tool
+>
+> This project exists **only to validate the A2A protocol and multi-agent negotiation
+> mechanics**. All data is demo data.
+>
+> The combination of "specific securities + specific customer segments + recommendation
+> rationale" that appears in the demo is precisely the core feature of **securities
+> investment advisory business**. Providing individual-stock advice to clients requires
+> a license in the jurisdiction.
+>
+> - **Not investment advice**; must not be used to give buy/sell guidance to real clients
+> - To productize, you would need: investment advisory license, investor suitability
+>   matching, record-keeping & audit trail, data-source licensing
+> - There is a persistent banner at the top of the page that cannot be dismissed — it
+>   **must still be visible when a screenshot is shared**
 
-| 节点 | 项目 | 真实能力 |
+Built with **lume** (server) + **lume-core** (language and `lib/peer.lume`) + **React**
+console, it **directly calls two real running lume applications**:
+
+| Node | Project | Real capabilities |
 |---|---|---|
-| `crm` | [lume-crm](https://github.com/erishen/lume-crm) | `crm.stats`（客户/商机/管道金额）、`crm.pipeline`（阶段分布） |
-| `scanner` | [lume-scanner](https://github.com/erishen/lume-scanner) | `scanner.meta`、`scanner.signals`（信号共振）、`scanner.picks`（选股） |
+| `crm` | [lume-crm](https://github.com/erishen/lume-crm) | `crm.stats` (customers / opportunities / pipeline value), `crm.pipeline` (stage distribution) |
+| `scanner` | [lume-scanner](https://github.com/erishen/lume-scanner) | `scanner.meta`, `scanner.signals` (signal resonance), `scanner.picks` (stock selection) |
 
-## 跑起来需要什么
+## What you need to run it
 
-Docker 一条命令（`make docker-up`）只需要本机和 `.env`，不用先 clone 别的仓库 ——
-`lume` 二进制与 `lume-core/lib` 都按版本从 GitHub release 取。
+A one-line Docker command (`make docker-up`) needs only this machine and `.env` — no need
+to clone other repos first. The `lume` binary and `lume-core/lib` are fetched by version
+from GitHub releases.
 
-**但本地开发（`make dev` / `make check`）需要同级目录**，因为源码里写的是相对
-import（`../lume-core/lib/peer.lume`），而 `Makefile` 的 `LUME` 默认取
-`../lume/bin/lume`：
+**But local development (`make dev` / `make check`) requires sibling directories**, because
+the source uses relative imports (`../lume-core/lib/peer.lume`), and the `Makefile`'s
+`LUME` defaults to `../lume/bin/lume`:
 
 ```
 work/lume/
-├── lume/          # 语言与运行时（提供 bin/lume）
-├── lume-core/     # lib/peer.lume 等共享模块
-├── lume-crm/      # 被调用的真实节点（peer 端口 18102）
-├── lume-scanner/  # 被调用的真实节点（peer 端口 18103）
-└── lume-a2a/      # 本项目
+├── lume/          # language & runtime (provides bin/lume)
+├── lume-core/     # shared modules like lib/peer.lume
+├── lume-crm/      # real node being called (peer port 18102)
+├── lume-scanner/  # real node being called (peer port 18103)
+└── lume-a2a/      # this project
 ```
 
 ```bash
@@ -44,471 +52,517 @@ git clone https://github.com/erishen/lume-crm    ../lume-crm
 git clone https://github.com/erishen/lume-scanner ../lume-scanner
 ```
 
-少任何一个，`make check` 会报 `cannot resolve import` 或找不到 `bin/lume` ——
-那是在告诉你缺目录，不是代码坏了。
+Missing any one of them, `make check` will report `cannot resolve import` or fail to find
+`bin/lume` — that is telling you a directory is missing, not that the code is broken.
 
-## 这个项目干什么
+## What this project does
 
-**今天该联系哪个行业的客户，由头是什么。**
+**Which industry's customers should be contacted today, and what the reason is.**
 
-销售卡住的往往不是「不知道该推什么」，而是**手上几十个客户，今天该主动联系谁**。
-scanner 知道「哪个行业今天不平静」，crm 知道「这个行业有哪些客户在跟进」——
-这份知识跨在两个系统上，谁都单独拿不出来。
+What blocks a salesperson is usually not "I don't know what to pitch," but **"I have
+dozens of customers and I don't know who to proactively reach out to today."** The scanner
+knows "which industry is restless today"; the CRM knows "which customers in that industry
+are being followed" — this knowledge spans two systems, and neither can produce it alone.
 
 ```
-行业整体动向（scanner，聚合到行业，不下探个股）
+Overall industry movement (scanner, aggregated to industry, not drilling into individual stocks)
      ×
-该行业在跟进中的客户数（crm，只给计数，不给姓名/邮箱/电话）
+Number of in-progress customers in that industry (crm, counts only, no names/emails/phones)
      ↓
-今日联系清单：哪个行业、几个客户、由头一句话
+Today's contact list: which industry, how many customers, one-line reason
 ```
 
-**输出只到行业级别，不含任何证券代码、不含买卖方向。**
+**Output stops at the industry level — no security codes, no buy/sell direction.**
 
-这不是措辞上的克制，而是产品定位：
+This is not careful wording; it is product positioning:
 
-| | 主体 | 输出 | 性质 |
+| | Subject | Output | Nature |
 |---|---|---|---|
-| 荐股工具 | 证券 | 「该推哪只票」 | 面向客户即属证券投资咨询，需持牌 |
-| **客户经营工具（本项目）** | **客户** | **「今天联系谁、由头是什么」** | 决定权留给销售与客户 |
+| Stock-picking tool | Securities | "Which stock to pitch" | Facing clients = securities investment advisory, requires a license |
+| **Customer-management tool (this project)** | **Customer** | **"Who to contact today, and why"** | Decision left to the salesperson & customer |
 
-原来的版本做的是前者。改成后者之后，同一个数据组合的用途变了 ——
-从「告诉客户买什么」变成「提示销售什么时候开口」。
+The original version did the former. After switching to the latter, the same data
+combination serves a different purpose — from "telling the customer what to buy" to
+"hinting the salesperson when to speak up."
 
-**关键点：两边都没交出明细。** crm 只给「金融 1 个客户、信息技术 1 个客户」，
-scanner 只给行业级的聚合动向。判定「该联系哪个行业」根本不需要知道客户叫什么 ——
-这正是真实跨系统协作该有的样子。
+**Key point: neither side hands over details.** The CRM only gives "Finance: 1 customer,
+IT: 1 customer"; the scanner only gives industry-level aggregate movement. Deciding "which
+industry to contact" doesn't require knowing any customer's name at all — this is what real
+cross-system collaboration should look like.
 
-## 项目结构（收敛后）
+## Project structure (after consolidation)
 
-早期版本为了把协议跑通，堆了 7 个演示能力（echo / aggregate / relay / plan / report / batch）
-和两条业务链路。收敛时做了减法：**只留真做的事**。
+Early versions piled up 7 demo capabilities (echo / aggregate / relay / plan / report /
+batch) and two business chains just to get the protocol working. The consolidation did
+subtraction: **keep only what it actually does.**
 
-**对外声明的 4 个能力**（Agent Card 与 `/api/capabilities` 同源）：
+**4 externally declared capabilities** (Agent Card and `/api/capabilities` share one source):
 
-| 能力 | 作用 | 边界 |
+| Capability | Purpose | Boundary |
 |---|---|---|
-| `sector.movement` | 行业级动向（涨跌家数、平均涨跌、样本量） | 不下探个股 |
-| `customer.reach` | 某行业有多少客户在跟进 | 只有计数，无姓名/邮箱/电话 |
-| `entity.resolve` | 按 USCC / 证券代码 / 别名解析实体 | 不做模糊匹配 |
-| `node.capabilities` | 自检：身份、能力、索引覆盖 | — |
+| `sector.movement` | Industry-level movement (advancers/decliners, average change, sample size) | No drilling into individual stocks |
+| `customer.reach` | How many customers in an industry are being followed | Counts only, no names/emails/phones |
+| `entity.resolve` | Resolve an entity by USCC / security code / alias | No fuzzy matching |
+| `node.capabilities` | Self-check: identity, capabilities, index coverage | — |
 
-**页面：**
+**Pages:**
 
-| 页面 | 回答的问题 |
+| Page | Question it answers |
 |---|---|
-| **客户经营** | 今天该联系哪个行业的客户、由头是什么 |
-| **A2A 协商** | 两个 agent 各持约束，怎么谈出一个可行解 |
-| **实体对齐** | 用 USCC 做实体主键，当前覆盖多少、缺口在哪 |
-| **这是什么 / 真实节点 / 节点接口** | 背景与自检 |
+| **Customer outreach** | Which industry's customers to contact today, and why |
+| **A2A negotiation** | Two agents each holding constraints — how to negotiate a feasible solution |
+| **Entity alignment** | USCC as the entity primary key — current coverage, where the gaps are |
+| **What is this / real nodes / node interfaces** | Background and self-check |
 
-**已删除**（保留文件但已从构建与路由中移除）：
+**Deleted** (files kept but removed from build & routing):
 
-- `/api/promote` 荐股链路 —— 与「客户经营」定位冲突，且合规风险大
-- `/api/compare`、演示场景页 —— 依赖已删的假能力，内容空洞
-- `echo.roundtrip` / `relay.forward` 等 6 个演示能力 —— 只为协议自测而造，会误导读者判断项目重心
+- `/api/promote` stock-picking chain — conflicts with "customer management" positioning, high compliance risk
+- `/api/compare`, demo scenario pages — depended on deleted fake capabilities, hollow content
+- `echo.roundtrip` / `relay.forward` and 5 other demo capabilities — built only for protocol self-test, misleading about the project's focus
 
-被删除的代码体积约 **1100 行**，保留了验收侧 56 条断言中的核心部分。
+Deleted code is about **1100 lines**; the core of the 56 acceptance assertions was retained.
 
-## A2A 协商：两个 agent 谈出一个方案
+## A2A negotiation: two agents negotiate a plan
 
-**这一节回答的是「为什么需要两个 agent，一个不够吗」。**
+**This section answers "why two agents — isn't one enough?"**
 
-前面几页不管多复杂，本质都是**单方决策**：客户 → 行业 → 标的 → 按分数排。
-那是一段固定规则，换成一个 SQL join 也能做出来 —— 不需要 agent。
+However complex the previous pages are, they are essentially **unilateral decisions**:
+customer → industry → target → sort by score. That's a fixed rule; you could do it with a
+SQL join — no agent needed.
 
-真正的 A2A 是**双方各自持有约束，谈出一个都能接受的方案**：
+Real A2A is **both parties each holding constraints, negotiating an outcome both can
+accept**:
 
 ```
-R1  选股侧  提议 五粮液（score 823，当日最高分）
-    客户侧  否决 —— "该行业仅 1 个客户，低于下限 2"，
-             并要求"换一个可触达数 ≥2 的行业"；同时让步：下限可降到 1
-R2  选股侧  按新要求重筛，提议 东风股份（score 471.9）
-    客户侧  接受 —— "行业汽车下有 1 个客户可触达（下限 1）"
+R1  Stock-picker side  proposes Wuliangye (score 823, highest of the day)
+    Customer side      vetoes — "only 1 customer in this industry, below floor 2",
+                       demands "switch to an industry with reachable count ≥ 2";
+                       meanwhile concedes: floor can drop to 1
+R2  Stock-picker side  re-screens per the new requirement, proposes Dongfeng (score 471.9)
+    Customer side      accepts — "1 reachable customer under Auto industry (floor 1)"
 ```
 
-**四件必须同时做到的事，少一件就退化成"通知"或"排序"：**
+**Four things that must all be true; missing any one degrades it to "notification" or
+"sorting":**
 
-| | 为什么必须 |
+| | Why it's mandatory |
 |---|---|
-| 双方都有否决权 | 只有一方能提、另一方只能接受，那不是协商 |
-| 否决要带**理由 + 要求** | 只说"不行"，对面无从调整，谈判原地打转 |
-| 让步是**双向**的 | 选股侧换掉最高分标的，客户侧把门槛从 2 降到 1。任一方硬扛，这个业务当下就无解 |
-| 完整对话留痕 | 只给结论，就分不清它是谈出来的还是算出来的 |
+| Both sides have veto power | If only one can propose and the other can only accept, that's not negotiation |
+| Veto must carry **reason + requirement** | Just saying "no" gives the other side nothing to adjust; the negotiation spins in place |
+| Concessions are **mutual** | The stock-picker swaps out the top-scoring target; the customer side lowers the threshold from 2 to 1. If either digs in, the business is unsolvable right now |
+| Full dialogue trace | Given only the conclusion, you can't tell whether it was negotiated or computed |
 
-**"最优"在这里的定义**：不是分数线最高，而是**在双方约束下能达成一致的最优**。
-五粮液分数最高但被否了 —— 这正是单方排序与协商的区别。
+**"Optimal" here is defined** as: not the highest score, but the **best achievable
+agreement under both parties' constraints**. Wuliangye has the highest score but was
+vetoed — that is exactly the difference between unilateral ranking and negotiation.
 
-### 两种引擎，同一页对比
+### Two engines, compared on the same page
 
-| | **规则驱动** | **LLM 推理** |
+| | **Rule-driven** | **LLM reasoning** |
 |---|---|---|
-| 代码 | `src/negotiate.lume` | `scripts/llm_negotiate.py` |
-| 谁在判断 | 写死的 if 规则 | `deepseek-chat` 扮演两个角色 |
-| 可复现 | 完全可复现 | **不保证**（同一输入两次可能不同结论） |
-| 耗时 | 毫秒 | 30–60 秒 |
-| 论证深度 | "触达 < 下限 2" | "该股四信号共振，量价与突破同时确认，领先第二名近一倍" |
+| Code | `src/negotiate.lume` | `scripts/llm_negotiate.py` |
+| Who judges | Hardcoded if-rules | `deepseek-chat` plays both roles |
+| Reproducible | Fully reproducible | **Not guaranteed** (same input may give different conclusions) |
+| Time | Milliseconds | 30–60 seconds |
+| Depth of argument | "reach < floor 2" | "The stock has four-signal resonance, volume-price and breakout both confirmed, nearly double the runner-up" |
 
-控制台「A2A 协商」页顶部可以切换引擎，直接对比两种输出。
+The console's "A2A Negotiation" page has an engine toggle at the top to compare both
+outputs directly.
 
-**LLM 版跑起来：**
+**Running the LLM version:**
 
 ```bash
-make llm-negotiate      # 约 30-60 秒，写 data/self/llm-negotiation.json
+make llm-negotiate      # ~30-60s, writes data/self/llm-negotiation.json
 ```
 
-控制台读**快照**而不是现场调模型——一轮协商 5–20 秒，而 lume 只有 2 个 worker，
-一个慢请求就能卡住整个控制台。快照缺失时页面明确说"尚未运行"，不回退到规则版冒充。
+The console reads the **snapshot** rather than calling the model live — one negotiation
+round takes 5–20s, and lume has only 2 workers; one slow request can stall the whole
+console. When the snapshot is missing the page explicitly says "not yet run" rather than
+silently falling back to the rule-driven version.
 
-### verify_fn：不让 LLM 评判自己
+### verify_fn: don't let the LLM grade itself
 
-这是从 `frameworks/*-pse` 借来的核心思想。LLM 最容易犯的错是**引用不存在的数字**
-（"该股 5 个信号共振"而实际是 2 个）。所以每轮结束都做程序化核对：
+This is the core idea borrowed from `frameworks/*-pse`. The LLM's most common mistake is
+**referencing numbers that don't exist** ("the stock has 5-signal resonance" when it's
+actually 2). So every round ends with a programmatic check:
 
-| 核对项 | 打回条件 |
+| Check | Rejection condition |
 |---|---|
-| 标的代码 | 不在当日候选清单里（禁止编造标的） |
-| 分数 / 信号数 | 与 A2A 取回的真实值不符 |
-| 信号名 | 提到的信号不在该标的实际信号中 |
-| 客户数 | 声称的触达数在真实行业分布里不存在 |
-| 否决 | 没给 `requirement`（对方无从调整） |
+| Target code | Not in the day's candidate list (forbids fabricating targets) |
+| Score / signal count | Doesn't match the real value fetched via A2A |
+| Signal name | Mentioned signal isn't among that target's actual signals |
+| Customer count | Claimed reachable count doesn't exist in the real industry distribution |
+| Veto | No `requirement` given (the other side has nothing to adjust) |
 
-不合规就打回重写，最多 3 次；三次不过则记 `blocked` 并终止，**不降级成"差不多的结果"**。
+Non-compliant output is sent back for rewrite, up to 3 times; failing all three marks it
+`blocked` and terminates — **no downgrading to "close enough"**.
 
-### 实测的一场协商（deepseek-chat，7 次调用 / 8504 tokens）
+### An actually-run negotiation (deepseek-chat, 7 calls / 8504 tokens)
 
 ```
-R1  选股侧  五粮液（score 823，唯一四信号共振）
-    客户侧  否决：食品饮料仅 1 个客户 < 下限 2
-             让步：若候选池凑不出，我方可降到 1
-R2  选股侧  宁德时代（当日涨幅 7.8% 全场最高）
-    客户侧  否决：电力设备不在 CRM 行业分布内，触达 0
-             "行业对不上就无法落到具体客户"
-R3  选股侧  接受该理由，改回五粮液
-             "放弃宁德时代：涨幅最高但行业不可触达"
-    客户侧  接受：1 ≥ 当前下限 1，四条硬约束全过
+R1  Stock-picker side  Wuliangye (score 823, only four-signal resonance)
+    Customer side      vetoes: Food & Beverage has only 1 customer < floor 2
+                       concedes: if the candidate pool can't satisfy, we can drop to 1
+R2  Stock-picker side  CATL (7.8% gain that day, highest in the market)
+    Customer side      vetoes: Electric Equipment not in CRM industry distribution, reach 0
+                       "if the industry doesn't match, it can't land on a specific customer"
+R3  Stock-picker side  accepts the reason, switches back to Wuliangye
+                       "drop CATL: highest gain but industry not reachable"
+    Customer side      accepts: 1 ≥ current floor 1, all four hard constraints pass
 ```
 
-**双方都改变了立场**：选股侧放弃了两只更高分的标的，客户侧把门槛从 2 降到 1。
+**Both sides changed position**: the stock-picker gave up two higher-scoring targets; the
+customer side lowered the threshold from 2 to 1.
 
-### 接 LLM 时踩到的三个坑（都是真的）
+### Three pitfalls when wiring up the LLM (all real)
 
-1. **说了让步没填数值** —— 客户侧文本写"可降至 1"但 `next_floor` 为空，对方拿不到这个让步。加了文本兜底提取，并在提示词里写死"说了就必须填"。
-2. **黑名单让让步失效** —— 五粮液被否后进了永久黑名单，客户侧明明说"降门槛后可以再提"，选股侧却看不到它了。改成门槛一旦下降就放开黑名单。
-3. **只给旧要求，不给新门槛** —— 选股侧按过时的 floor=2 判断"没有候选"。现在每轮显式告诉它当前 floor。
+1. **Said the concession but didn't fill in the number** — the customer side's text said
+   "can drop to 1" but `next_floor` was empty, so the other side never got the concession.
+   Added text fallback extraction, and the prompt now hard-codes "if you say it, you must
+   fill it in."
+2. **Blacklist made the concession ineffective** — after Wuliangye was vetoed it went on a
+   permanent blacklist; the customer side explicitly said "you can re-propose after
+   lowering the threshold," but the stock-picker couldn't see it. Changed so that once the
+   threshold drops, the blacklist opens up.
+3. **Only gave the old requirement, not the new floor** — the stock-picker judged "no
+   candidates" against a stale floor=2. Now each round explicitly tells it the current
+   floor.
 
-这三个都不是模型笨，是**编排逻辑没把谈判状态传对**。
+None of these three is the model being dumb — they are **orchestration logic not passing
+negotiation state correctly**.
 
-## 实体对齐（往 Ontology 方向走的第一步）
+## Entity alignment (first step toward an Ontology)
 
-**问题**：名字不可靠——会重名、会改、简称全称不一致。「中科能源科技」到底是谁？
-靠字符串永远说不清，而且错得很安静。
+**Problem**: names are unreliable — duplicates, renames, inconsistent short/full forms.
+Who is "Zhongke Energy Technology" exactly? Strings can never answer that, and it fails
+quietly.
 
-**做法**：用**统一社会信用代码（USCC）**和**证券代码**做实体主键，建立
-`客户公司 ↔ 上市公司` 的连接。新增 `src/entity.lume`（校验与规范化）与
-`src/graph.lume`（索引与解析）。
+**Approach**: use **Unified Social Credit Code (USCC)** and **security code** as entity
+primary keys, establishing a `customer company ↔ listed company` connection. Added
+`src/entity.lume` (validation & normalization) and `src/graph.lume` (index & resolution).
 
-三条硬规则：
+Three hard rules:
 
-1. **主键不是名字。** 名称只作别名，且别名必须人工登记。
-2. **没有 USCC 就不认。** 不做名称模糊匹配——错配的代价不对称：漏配只是少一条
-   推荐，错配会把 A 公司的商机挂到 B 公司的股票上，而使用者不会去核对。
-3. **匹配要能解释。** 每条解析都带 `method`（uscc / code / alias）与原因。
+1. **The primary key is not a name.** Names serve only as aliases, and aliases must be
+   registered by hand.
+2. **No USCC, no recognition.** No fuzzy name matching — the cost of a mismatch is
+   asymmetric: a miss is just one fewer recommendation, but a wrong match hangs company A's
+   opportunity on company B's stock, and no one will check.
+3. **Matches must be explainable.** Every resolution carries a `method`
+   (uscc / code / alias) and a reason.
 
-三类结果分开返回，因为它们要不同的人去处理：
+Three result classes are returned separately because different people handle them:
 
-| 状态 | 含义 | 该怎么办 |
+| Status | Meaning | What to do |
 |---|---|---|
-| `matched` | 标识齐全且命中索引 | 直接用 |
-| `unresolved` | 缺标识，或未收录 | 补数据 |
-| `invalid` | 填了 USCC 但校验位不过 | **修数据**（脏数据） |
+| `matched` | Identifiers complete and index hit | Use directly |
+| `unresolved` | Missing identifier, or not indexed | Add data |
+| `invalid` | USCC provided but check digit fails | **Fix data** (dirty data) |
 
-> 校验位是真校验（GB 32100 算法）。实测救过一次：我记忆里的五粮液 USCC 末位是错的，
-> 算法当场判不通过，后来查证真实值才补上。**如果没这层校验，错的代码会当成真标识用下去。**
+> The check digit is real validation (GB 32100 algorithm). It saved me once in practice:
+> the last digit of the Wuliangye USCC I remembered was wrong; the algorithm rejected it on
+> the spot, and I only confirmed the real value afterward. **Without this validation layer,
+> a wrong code would be used as a true identifier.**
 
-**当前覆盖情况（页面「实体对齐」页可见）**
+**Current coverage (visible on the "Entity Alignment" page)**
 
-- 索引 **8 个实体，USCC 全部校验通过**（GB 32100 校验位 + 2 个以上公开来源交叉核对）
-- 当日 8 只有信号的标的 **8/8 命中**，缺口清零
-- 5 个有信号的行业全部是 `exact`；「信息技术」「金融」当日无信号，仍标 `keyword`
-  ——**这个差别始终显示在界面上，不藏起来**
+- Index **8 entities, all USCCs pass validation** (GB 32100 check digit + cross-checked
+  against 2+ public sources)
+- The day's 8 signalled targets **8/8 hit**, gaps cleared to zero
+- All 5 industries with signals are `exact`; "IT" and "Finance" had no signal that day,
+  still marked `keyword` — **this difference is always shown on the UI, not hidden**
 
-每条实体的 `source` 字段记录了 USCC 的核对来源（企查查 / 启信宝 / 天眼查 /
-上交所公告），别人复核时知道该去哪查。
+Each entity's `source` field records where the USCC was cross-checked (Qichacha / Qixinbao /
+Tianyancha / SSE announcements), so anyone re-verifying knows where to look.
 
-## 关于「行业」这个字段，必须说清楚
+## About the "industry" field, this must be said clearly
 
-**上游两个项目都没有行业字段。** scanner 的标的只有代码/名称/价格/信号/评分，
-crm 的客户只有姓名/公司/管道金额。
+**Neither upstream project has an industry field.** The scanner's targets only have
+code/name/price/signal/score; the CRM's customers only have name/company/pipeline value.
 
-实体索引能提供 `exact` 的依据，但目前只覆盖 3 家。其余行业仍依赖
-`src/industry.lume` 的**人工映射表**（40 只标的 + 18 条公司名关键词规则）。
-这件事写在页面上、也写在 `sources.industry_map` 里，因为把人工映射藏进业务代码，
-读的人会以为行业是上游给的 —— 一旦某只票改行/被并购，没人知道该改哪里。
+The entity index can provide an `exact` basis, but currently covers only 3 companies. The
+rest still rely on `src/industry.lume`'s **manual mapping table** (40 targets + 18
+company-name keyword rules). This is written on the page and in `sources.industry_map`,
+because hiding a manual mapping inside business code makes readers think the industry came
+from upstream — once a stock changes industry / gets acquired, no one knows where to update.
 
-## 下一步该做什么（诚实版）
+## What to do next (honest version)
 
-实体对齐才刚起头，按重要性排：
+Entity alignment is just starting. In priority order:
 
-1. **给 crm 加 USCC 字段**——这是根上的缺失。没有它，客户永远只能靠名字猜。
-2. **把当日信号标的补齐到索引**——现在 8 只里有 5 只没覆盖，补完 `basis` 才能大面积变 `exact`。
-3. **关系层**：集团—子公司—标的。Ontology 的价值一大半在「沿关系跳」，现在只有一跳。
-4. **对象级权限**：现在是节点级（能调就能调全部）。
+1. **Add a USCC field to the CRM** — this is the root gap. Without it, customers can only
+   ever be guessed by name.
+2. **Fill the day's signalled targets into the index** — 5 of the 8 aren't covered; once
+   filled, `basis` can largely become `exact`.
+3. **Relationship layer**: group — subsidiary — target. Much of an Ontology's value is in
+   "hopping along relationships"; now there's only one hop.
+4. **Object-level permissions**: now it's node-level (if you can call it, you can call
+   everything).
 
-
-当前数据的实际情况：CRM 的 4 个客户归到「金融」「信息技术」两个行业，而当日
-scanner 的 8 只入选标的全在食品饮料/汽车/钢铁等行业。所以页面上这两个行业显示的是
-**「9 只同行业潜在标的，今日 0 只有信号」** —— 这不是 bug，是当日真实结果。
-把「潜在关注」也列出来，比显示一个空列表更有用；但每只都明确标了有没有信号，
-否则它就退化成一张普通股票列表。
+The current data reality: the CRM's 4 customers fall under "Finance" and "IT", while the
+scanner's 8 selected targets that day are all in Food & Beverage / Auto / Steel, etc. So
+these two industries show **"9 same-industry potential targets, 0 with signals today"** on
+the page — not a bug, it's the real result of that day. Listing "potential watchlist" too
+is more useful than showing an empty list; but each is clearly marked whether it has a
+signal, otherwise it degenerates into a plain stock list.
 
 ```
-cp .env.example .env   # 填 PEER_ROOT(与 crm/scanner 一致)
-make docker-up         # 起本节点, 控制台 http://127.0.0.1:10190
-make fleet-verify      # 25 条断言: 在线 / 签名 / 真实字段 / 白名单 / 现场对比
+cp .env.example .env   # fill PEER_ROOT (match crm/scanner)
+make docker-up         # start this node, console http://127.0.0.1:10190
+make fleet-verify      # 25 assertions: online / signature / real fields / whitelist / on-site comparison
 ```
 
-## 为什么要接真实节点
+## Why connect to real nodes
 
-自造的 echo / aggregate 只能证明「两台机器能互相发 HTTP」，证明不了 A2A 有用。
-接上 crm 与 scanner 之后，验的是**两个独立项目能不能互相认出来并交换真实数据**，
-而且这两个项目都公开可查，别人可以照着复现。
+Self-made echo / aggregate can only prove "two machines can send HTTP to each other," not
+that A2A is useful. Hooked up to the CRM and scanner, what's being verified is **whether two
+independent projects can recognize each other and exchange real data** — and both projects
+are publicly inspectable, so others can reproduce it.
 
-这条链路上有三道真实的门槛，任何一道过不去都表现为「调不通」：
+There are three real hurdles on this chain; failing any one shows up as "can't call
+through":
 
-1. **密钥模式要一致。** 两个真实节点跑的是 derived 模式
-   （`key(node) = hmac_sha256(PEER_ROOT, "peer:" + node)`）。配 `PEER_SHARED`
-   的话签名**算得出来但是错的**，对端一律回 `bad signature` —— 报错完全指不到
-   「模式不匹配」。
-2. **要登记。** 密钥正确仍会被拒：`unknown peer 'lume-a2a' (not in registry)`。
-   这是身份可信层在起作用（防止拿自己的密钥冒充别人），不是 bug。
-   两侧的 `.data/peers-identity.json` 需要加上本节点。
-3. **容器里的 127.0.0.1 不是宿主。** crm/scanner 跑在宿主上，容器内要用
-   `host.docker.internal:18102`。
+1. **Key mode must match.** Both real nodes run derived mode
+   (`key(node) = hmac_sha256(PEER_ROOT, "peer:" + node)`). With `PEER_SHARED` configured,
+   the signature is **computable but wrong**; the peer always replies `bad signature` — the
+   error gives no hint it's a "mode mismatch."
+2. **You must be registered.** Correct key still rejected: `unknown peer 'lume-a2a' (not in
+   registry)`. This is the identity-trust layer working (preventing you from impersonating
+   others with your own key), not a bug. Both sides' `.data/peers-identity.json` need this
+   node added.
+3. **127.0.0.1 in a container is not the host.** The CRM/scanner run on the host; from
+   inside the container use `host.docker.internal:18102`.
 
-## 接入真实节点（复现步骤）
+## Connecting to real nodes (reproduction steps)
 
 ```bash
-# 1. 存档根密钥: 与 crm / scanner 的 PEER_ROOT 保持一致
+# 1. Store the root key: match crm/scanner's PEER_ROOT
 cp .env.example .env && vi .env     # PEER_ROOT=...  PEER_NAME=lume-a2a
 
-# 2. 在两侧注册表登记本节点(不加会 401: unknown peer)
-#    编辑 lume-crm/.data/peers-identity.json 与 lume-scanner/.data/peers-identity.json
+# 2. Register this node in both registries (else 401: unknown peer)
+#    Edit lume-crm/.data/peers-identity.json and lume-scanner/.data/peers-identity.json
 #    "peers": [..., "lume-a2a"]
-#    注册表是实时读取的, 不需要重启对端
+#    The registry is read live; no need to restart the peer
 
-# 3. 起本节点
+# 3. Start this node
 make docker-up
 make fleet-verify
 ```
 
-> ⚠️ **本仓库准备开源**，所以 `.env` 被 `.gitignore` 挡住，仓库里只有
-> `.env.example`（字段名 + 说明，无真实值）。发布前跑 `make privacy`：
-> 它会检查凭据是否泄漏到任何文件里。派生密钥一旦公开，任何人都能冒充任何节点签名。
+> ⚠️ **This repo is preparing for open-sourcing**, so `.env` is blocked by `.gitignore`; the
+> repo only has `.env.example` (field names + explanation, no real values). Before
+> publishing, run `make privacy`: it checks whether credentials have leaked into any file.
+> Once a derived key is public, anyone can impersonate any node's signature.
 
-## 三个协议场景（自造节点）
+## Three protocol scenarios (self-made nodes)
 
-真实节点演示「能互访」，协议细节则由一对临时节点演示，默认在「场景」页，
-点一下就能看到一次完整交互里的每一跳：
+Real nodes demonstrate "can visit each other"; protocol details are demonstrated by a pair
+of temporary nodes, default on the "Scenarios" page — click once to see every hop of a
+complete interaction:
 
-| 场景 | 演示的规范能力 | 看什么 |
+| Scenario | Spec capability demonstrated | What to look at |
 |---|---|---|
-| **① 多轮补全** | `input-required` + 同 taskId 续发 | 第一次只说主题 → 对端反问缺 `period`；补上后**还缺 `audience`**（不是一次问完）；补齐才产出。`history` 记满 3 轮 |
-| **② 长任务** | `submitted → working → completed`、`tasks/get`、`tasks/cancel` | 提交立刻拿到 taskId 而**不等处理完**；轮询逐条看进度；中途取消后 worker 真的不再推进 |
-| **③ 任务分解** | 能力发现 + 分工 | 只给目标，对端报「哪些自办、哪些要别的节点、哪些**没人会**」 |
+| **① Multi-round completion** | `input-required` + re-send with same taskId | First message only gives the topic → peer asks back for missing `period`; after filling, it **still needs `audience`** (not all asked at once); only then does it produce output. `history` records all 3 rounds |
+| **② Long-running task** | `submitted → working → completed`, `tasks/get`, `tasks/cancel` | Submit and immediately get a taskId **without waiting for completion**; poll to see progress step by step; after canceling mid-way, the worker really stops advancing |
+| **③ Task decomposition** | Capability discovery + division of labor | Only give a goal; the peer reports "which it does itself, which need other nodes, and which **nobody can do**" |
 
-三个都内置了一句「为什么这么做」，因为在同一处做错很难被发现：
+Each has a built-in "why do it this way" because a mistake in the same place is hard to
+notice:
 
-- 缺参数时**猜一个默认值**接着跑 —— 会产出一份「看起来成功」的报告，调用方
-  不知道数据是编的。这比直接报错危险得多。
-- 长任务**占着连接等** —— 客户端会等到超时，而任务其实还在正常跑。
-- 认不出的需求**假装覆盖** —— 得到一份缺内容的报告，而调用方以为完整。
+- **Guess a default value** when a parameter is missing and keep going — produces a "looks
+  successful" report while the caller doesn't know the data is fabricated. Far more
+  dangerous than an outright error.
+- Long task **holds the connection while waiting** — the client times out while the task is
+  actually still running fine.
+- An unrecognized requirement **pretends to cover it** — yields a report missing content,
+  while the caller assumes it's complete.
 
-另外补了 `message/stream`（真 SSE，`status-update` / `artifact-update` 按序到达，
-末帧 `final=true`），让 Agent Card 里的 `streaming: true` 不再是空话 ——
-**之前它是空话**，而夸报比不写更糟：客户端会等一条永远不来的流。
+Also added `message/stream` (real SSE, `status-update` / `artifact-update` arriving in
+order, last frame `final=true`), so the Agent Card's `streaming: true` is no longer empty
+talk — **it was empty talk before**, and overstating is worse than not writing it: the
+client would wait for a stream that never comes.
 
-## 它演示了什么
+## What it demonstrates
 
-单次「发过去→拿回来」看不出 A2A 的价值，只看得出两台机器能互相发 HTTP。
-所以三个场景都刻意设计成**必须往返两次以上**：
+A single "send over → get back" doesn't show the value of A2A, only that two machines can
+send HTTP to each other. So the three scenarios are deliberately designed to **require two
+or more round-trips**:
 
-| 场景 | 演示的规范能力 | 看什么 |
+| Link | Protocol | Description |
 |---|---|---|
-| **① 多轮补全** | `input-required` + 同 taskId 续发 | 第一次只说主题 → 对端反问缺 `period`；补上后**还缺 `audience`**（不是一次问完）；补齐才产出。`history` 记满 3 轮 |
-| **② 长任务** | `submitted → working → completed`、`tasks/get`、`tasks/cancel` | 提交立刻拿到 taskId 而**不等处理完**；轮询逐条看进度；中途取消后 worker 真的不再推进 |
-| **③ 任务分解** | 能力发现 + 分工 | 只给目标，对端报「哪些自办、哪些要别的节点、哪些**没人会**」 |
+| Discovery | `GET /.well-known/agent-card.json` | Standard A2A path, public & unauthenticated. Any client can learn this node's capabilities without private conventions |
+| Invoke | `POST /a2a` (JSON-RPC) | `message/send` / `tasks/get` / `tasks/cancel`. Returns the full Task (status + artifacts + trace) |
+| Direct | `POST /peer/invoke` (HMAC-signed) | Low-overhead channel for a LAN trust domain; signature covers method + path + body |
+| Multi-hop | `POST /peer/relay` | A→B→C forwarding, with hop limit |
 
-三个都内置了一句「为什么这么做」，因为在同一处做错很难被发现：
-
-- 缺参数时**猜一个默认值**接着跑 —— 会产出一份「看起来成功」的报告，调用方
-  不知道数据是编的。这比直接报错危险得多。
-- 长任务**占着连接等** —— 客户端会等到超时，而任务其实还在正常跑。
-- 认不出的需求**假装覆盖** —— 得到一份缺内容的报告，而调用方以为完整。
-
-另外补了 `message/stream`（真 SSE，`status-update` / `artifact-update` 按序到达，
-末帧 `final=true`），让 Agent Card 里的 `streaming: true` 不再是空话 ——
-**之前它是空话**，而夸报比不写更糟：客户端会等一条永远不来的流。
-
-## 它演示了什么
-
-| 链路 | 协议 | 说明 |
-|---|---|---|
-| 发现 | `GET /.well-known/agent-card.json` | 标准 A2A 路径, 公开未认证。任何客户端不需要私有约定就能知道这个节点有什么能力 |
-| 调用 | `POST /a2a`(JSON-RPC) | `message/send` / `tasks/get` / `tasks/cancel`。返回完整 Task(状态 + artifacts + 轨迹) |
-| 直连 | `POST /peer/invoke`(HMAC 签名) | 局域网互信域的低开销通道, 签名覆盖 method + path + body |
-| 多跳 | `POST /peer/relay` | A→B→C 转发, 带跳数上限 |
-
-两条通道(peer 私有 / A2A 标准)**共用同一个 `dispatch()`**，所以不会出现
-「card 里说有、点进去 404」这类两套口径的问题。
+Both channels (peer-private / A2A-standard) **share the same `dispatch()`**, so there's no
+"it's in the card but 404 on click" two-sources-of-truth problem.
 
 ## Docker
 
 ```
-make docker-up      # 构建 + 起两个容器
-make docker-verify  # 对容器里的两个节点跑 20 条断言
-make docker-down    # 停掉
+make docker-up      # build + start two containers
+make docker-verify  # run 20 assertions against the two nodes in containers
+make docker-down    # stop
 ```
 
-| 服务 | 控制台 | 容器内地址 |
+| Service | Console | In-container address |
 |---|---|---|
 | node-a | http://127.0.0.1:10190 | `http://node-a:18190` |
 | node-b | http://127.0.0.1:10191 | `http://node-b:18190` |
 
-两个服务**共用同一个镜像** `lume-a2a`，只靠 `PEER_NAME` 区分角色 —— 否则任何
-一次改动都可能只 rebuild 了一边，出现「A 能调 B、B 调不回 A」，而这种现象极难看出来。
+Both services **share the same image** `lume-a2a`, distinguished only by `PEER_NAME` —
+otherwise any change might rebuild only one side, giving "A can call B but B can't call A
+back," which is extremely hard to spot.
 
-三处必须显式处理、否则一定踩的：
+Three things that must be handled explicitly, or you will trip:
 
-1. **`PEER_PUBLIC_URL` 必须设成服务名。** 容器里 `127.0.0.1` 指向容器自己。
-   不设的话 Agent Card 会宣告 `http://127.0.0.1:18190`，字段看起来全对，
-   客户端照着连必然失败。
-2. **宿主端口不能当作节点间地址。** 宿主的 `127.0.0.1:10191` 在 node-a 里是
-   它自己。所以 `probe.py` 第 4/5 个参数单独传「节点内部视角」的地址
-   （`make docker-verify` 已带好 `node-b:18190 node-a:18190`）。
-3. **二进制必须来自源码构建，不能用 v0.11.0 release 包。** release 里没有
-   `ed25519_pubkey`，而 `lume-core/lib/identity.lume` 模块级会调用它 ——
-   容器起不来，报 `undefined variable 'ed25519_pubkey'`，重复重启。
-   `vendor/` 里放的是源码构建产物（含 TLS 预热修复），见 `vendor/.lume-build`。
+1. **`PEER_PUBLIC_URL` must be set to the service name.** In a container `127.0.0.1`
+   points at itself. Unset, the Agent Card advertises `http://127.0.0.1:18190` — the fields
+   all look right, and clients following them will surely fail.
+2. **Host ports can't be used as inter-node addresses.** The host's `127.0.0.1:10191` from
+   node-a's perspective is itself. So `probe.py` takes the "node-internal view" addresses as
+   arguments 4/5 (`make docker-verify` already passes `node-b:18190 node-a:18190`).
+3. **The binary must come from source build, not the v0.11.0 release package.** The release
+   lacks `ed25519_pubkey`, which `lume-core/lib/identity.lume` calls at module level — the
+   container won't start, reporting `undefined variable 'ed25519_pubkey'`, repeatedly.
+   `vendor/` holds the source-built artifact (including the TLS warm-up fix); see
+   `vendor/.lume-build`.
 
-`lume-core/lib` 在镜像里放在**根目录** `/lume-core/lib`：源码写的是
-`../lume-core/lib/peer.lume`，从 `/app` 解析出来就是这个位置。平铺到
-`/app/lume-core` 会报 `cannot resolve import`。
+`lume-core/lib` is placed at the **root** `/lume-core/lib` in the image: the source writes
+`../lume-core/lib/peer.lume`, which resolves there from `/app`. Flattening it to
+`/app/lume-core` gives `cannot resolve import`.
 
-## 「问 Agent」页：纯 lume，无额外进程
+## "Ask Agent" page: pure lume, no extra process
 
-页面调框架原生的 `POST /react/api/chat`（SSE 流式），工具注册在
-`src/agent.lume`。**没有独立服务进程，容器里也没有 python3。**
+The page calls the framework-native `POST /react/api/chat` (SSE streaming); tools are
+registered in `src/agent.lume`. **No separate service process; no python3 in the
+container.**
 
 ```
-make ask Q="哪个行业的客户推进得最靠前？"   # 命令行试一次，看流式过程
+make ask Q="which industry's customers are furthest along?"   # try once from the CLI, watch streaming
 ```
 
-### 它是怎么工作的
+### How it works
 
-| 环节 | 谁负责 |
+| Step | Who's responsible |
 |---|---|
-| 工具注册 `tool "name","desc",{schema},fn` | 本仓库 `src/agent.lume` |
-| ReAct 多轮循环（默认 8 轮） | 框架 `agent.c` |
-| 调模型（fork + exec curl，TLS 交给 curl） | 框架 |
-| HMAC 签名 / 注册表校验 / trace 埋点 | `lume-core/lib/peer.lume` + `src/fleet.lume` |
-| 答案流式下发 | `/react/api/chat` SSE |
+| Tool registration `tool "name","desc",{schema},fn` | this repo's `src/agent.lume` |
+| ReAct multi-round loop (default 8 rounds) | framework `agent.c` |
+| Call the model (fork + exec curl, TLS left to curl) | framework |
+| HMAC signing / registry check / trace points | `lume-core/lib/peer.lume` + `src/fleet.lume` |
+| Streamed answer delivery | `/react/api/chat` SSE |
 
-每个工具只是 `fleet.invoke(...)` 的一行包装 —— 那是**跨节点调用的唯一入口**，
-所以 Agent 页的「调用流水」能看到它自己决定发起的每一次调用。
+Each tool is just a one-line wrapper around `fleet.invoke(...)` — that is **the only entry
+point for cross-node calls**, so the Agent page's "call log" shows every call it decided to
+make itself.
 
-SSE 事件：
+SSE events:
 
 ```
-data: {"t":"note","d":"tool crm_stages({})"}   它决定调哪个工具
-data: {"t":"note","d":"round 2/8"}            进到第几轮
-data: {"t":"delta","d":"信息技术"}             答案片段
+data: {"t":"note","d":"tool crm_stages({})"}   which tool it decided to call
+data: {"t":"note","d":"round 2/8"}             which round
+data: {"t":"delta","d":"IT"}                   answer fragment
 data: {"t":"error","d":"..."} / {"t":"done"}
 ```
 
-### 这段代码原来有 Python，为什么删了
+### Why the Python in this code was removed
 
-早先有个 `scripts/agent_server.py` + `agent_chat.py`：宿主机上跑一个小 HTTP
-服务，手写 ReAct 循环、工具表、JSON 协议、HMAC 签名。问题不在于"能不能跑"，
-而在于**框架本来就自带这些**（`agent.c:762` 的循环、`interp.c:1452` 的
-`hmac_sha256`）。那份 Python 是在已有能力之上又实现了一遍。
+There used to be a `scripts/agent_server.py` + `agent_chat.py`: a small HTTP service on the
+host, hand-writing the ReAct loop, tool table, JSON protocol, and HMAC signing. The problem
+wasn't "can it run" but that **the framework already has all of it** (`agent.c:762` loop,
+`interp.c:1452` `hmac_sha256`). That Python re-implemented existing capability on top of
+itself.
 
-代价是实的：多一个进程 = 多一种"服务没起"的故障（页面报「Agent 服务不可达」，
-而人分不清是没开还是代码坏了）；容器要多装 python3；那个 `threading.Lock`
-在 `fork-per-connection` 下也**根本不起排队作用**（锁在进程内，两个请求是
-两个 fork）。
+The cost was real: one more process = one more "service didn't start" failure (page reports
+"Agent service unreachable," and you can't tell whether it's off or the code is broken); the
+container needed python3 installed; and that `threading.Lock` under `fork-per-connection`
+**doesn't queue at all** (the lock lives within a process; two requests are two forks).
 
-删掉后镜像仍是 121MB，`docker exec lume-a2a python3` 是 `not found`。
+After removal the image is still 121MB, and `docker exec lume-a2a python3` is `not found`.
 
-### 踩过的坑
+### Pitfalls hit
 
-**工具名不能有小数点。** 节点侧能力是 `crm.stats`，但注册成工具必须写
-`crm_stats` —— OpenAI 兼容接口要求 `function.name` 匹配 `^[a-zA-Z0-9_-]+$`，
-带点号被上游回 `400 Invalid 'tools[0].function.name'`。本地看不出来（工具
-注册成功、`tools()` 里也有），只有真发出去才炸，而报错文案指不到"名字里有个点"。
+**Tool names can't have dots.** The node-side capability is `crm.stats`, but registering it
+as a tool must write `crm_stats` — the OpenAI-compatible interface requires `function.name`
+to match `^[a-zA-Z0-9_-]+$`; with a dot, upstream returns
+`400 Invalid 'tools[0].function.name'`. You can't see it locally (the tool registers fine
+and shows up in `tools()`); it only blows up when actually sent, and the error message
+doesn't point to "a dot in the name."
 
-**`env()` 读不到 `LLM_API_KEY`。** 那是安全设计：名字含 `API_KEY`/`SECRET`
-的变量一律返回 `null`，防止脚本把凭据读出来发走。所以不能用它判断"配置好了没"，
-那个判断恒为 false，比不判断更误导。
+**`env()` can't read `LLM_API_KEY`.** That's by design: variables whose name contains
+`API_KEY`/`SECRET` always return `null`, preventing scripts from reading credentials out and
+sending them. So you can't use it to check "is it configured" — that check is always false,
+which is more misleading than not checking.
 
-## 架构
+## Architecture
 
 ```
-node.lume            路由 + JSON-RPC 解析 + 启动自检
-src/a2a.lume         任务状态机 / Agent Card / dispatch(三条链路的唯一实现)
-src/catalog.lume     能力目录(前端面板、Agent Card skills、派发 三处同一来源)
-src/proto_encode.lume 帧编解码的纯函数(被服务端调用, 也便于单测)
-src/ui/*              React 控制台(esbuild 打包到 www/)
-scripts/verify.sh    端到端验收(起两个节点 → 跑断言 → 关掉)
-scripts/probe.lume   断言本体(签名直接复用 peer.signed_url)
-scripts/check_public.lume  开原前闸门: 仓库里不得出现真实凭据
-scripts/seed_crm.lume      给 CRM 补演示客户(幂等)
+node.lume            routing + JSON-RPC parsing + startup self-check
+src/a2a.lume         task state machine / Agent Card / dispatch (sole implementation for all three links)
+src/catalog.lume     capability catalog (frontend panel, Agent Card skills, dispatch — three sources, one origin)
+src/proto_encode.lume  frame encode/decode pure functions (called by server, also unit-testable)
+src/ui/*             React console (esbuild-bundled to www/)
+scripts/verify.sh    end-to-end acceptance (start two nodes → run assertions → stop)
+scripts/probe.lume   assertion body (signing reuses peer.signed_url directly)
+scripts/check_public.lume  pre-open-source gate: no real credentials in the repo
+scripts/seed_crm.lume      add demo customers to CRM (idempotent)
 ```
 
-签名/验签/单次请求全部复用 **`../lume-core/lib/peer.lume`** —— 不复制一份，
-因为两份实现一定会漂移，而漂移的表现是「一边通过、一边 401」。
+Signing/verifying/one-shot requests all reuse **`../lume-core/lib/peer.lume`** — no copy,
+because two implementations will always drift, and drift shows up as "one side passes, one
+side 401."
 
-## 任务状态机
+## Task state machine
 
 ```
 submitted ──▶ working ──▶ completed
                   └────▶ failed
-                  └────▶ rejected      (未知能力 / 跳数超限)
-   └──▶ input-required  (认不出意图, 要求客户端明确指定能力)
+                  └────▶ rejected      (unknown capability / hop limit)
+   └──▶ input-required  (intent unrecognized, asks client to name the capability)
 ```
 
-任务落盘在 `.data/a2a-tasks/<节点名>/<id>.json`。
+Tasks are persisted at `.data/a2a-tasks/<node-name>/<id>.json`.
 
-**按节点名隔离**不是洁癖：两个节点若从同一目录启动，共用一份任务目录会互相
-「看到对方的任务」，`tasks/get` 能把别的节点的任务查出来。实测踩过。
+**Isolation by node name** isn't pedantry: if two nodes start from the same directory, they
+share one task directory and "see each other's tasks"; `tasks/get` can query another node's
+task. Hit this in practice.
 
-## 三个刻意的设计取舍
+## Three deliberate design tradeoffs
 
-**1. 认不出意图就 `input-required`，不猜。**
-猜错的代价是「看起来成功了但答非所问」，比多问一轮糟得多。
+**1. Unrecognized intent → `input-required`, don't guess.**
+Guessing wrong costs "looks successful but answers the wrong thing," far worse than asking
+one more round.
 
-**2. 对端不可达标 `unreachable`，绝不填 0。**
-这条来自 `lume-lan` 的实测：对端 `sql_query` 在并发写入时静默返回空，peer 把
-`0` 当成事实转发，agent 于是回答「你的博客是空的」。拿不到就说拿不到。
+**2. Peer unreachable → `unreachable`, never fill in 0.**
+This comes from a `lume-lan` real-world test: the peer's `sql_query` silently returned
+empty during concurrent writes, the peer forwarded `0` as fact, and the agent answered
+"your blog is empty." If you can't get it, say you can't get it.
 
-**3. 环路保护用硬上限，不做环检测。**
-每个节点只能看到自己收到的 `hops`，没有全局视野；检测环需要全局状态。
-所以约定 `hops` 单调递增，到 3 直接拒。代价是合法长链路被截断，收益是两个
-节点互转不会把 CPU 打满。
+**3. Loop protection uses a hard limit, not loop detection.**
+Each node only sees the `hops` it received; there's no global view; detecting loops needs
+global state. So `hops` is agreed to be monotonically increasing, and at 3 it's rejected
+outright. Cost: legitimate long chains get cut; benefit: two nodes bouncing won't peg the
+CPU.
 
-## 已知边界
+## Known boundaries
 
-- **明文传输**：lume 的 `http_*` 不支持自定义 CA，签名保证不可伪造/篡改，
-  但**不加密**。别经此通道传密码、证件号。
-- **防重放是时间窗级别**：同一 nonce 在 `PEER_SKEW_SECS` 窗口内重放仍会通过。
-- **帧文本只保证 ASCII 保真**：lume 没有「取第 i 个字节的数值」的内建，
-  非 ASCII 字符在 query 帧里会落成 `~3F`。需要无损传中文走 A2A 的 JSON body。
-- **没有异步后台执行**：lume 无 `spawn`/`exec`，`http_*` 同步阻塞。
-  本演示的 `message/send` 都是同步执行完再返回；长任务模型见 `lume-lan` 的
-  `a2a_worker.py` 做法（登记 `submitted`，宿主进程推进）。
-- **控制台的 `/api/*` 不鉴权**：只读 + 不含凭据，前提是只绑 `127.0.0.1`。
+- **Plaintext transport**: lume's `http_*` doesn't support a custom CA; signatures
+  guarantee non-forgery / non-tampering, but **no encryption**. Don't send passwords or ID
+  numbers through this channel.
+- **Replay protection is time-window-level**: the same nonce replayed within the
+  `PEER_SKEW_SECS` window still passes.
+- **Frame text only guarantees ASCII fidelity**: lume has no builtin for "take the numeric
+  value of the i-th byte"; non-ASCII characters fall to `~3F` in query frames. For lossless
+  Chinese, use the A2A JSON body.
+- **No async background execution**: lume has no `spawn`/`exec`; `http_*` blocks
+  synchronously. This demo's `message/send` all execute synchronously and return; for the
+  long-task model see `lume-lan`'s `a2a_worker.py` approach (register `submitted`, host
+  process advances).
+- **The console's `/api/*` has no auth**: read-only + no credentials, provided it's bound
+  to `127.0.0.1` only.
 
-## 安全模型
+## Security model
 
 ```
 sig = hmac_sha256(PEER_SHARED, node \n ts \n nonce \n scope)
@@ -516,42 +570,45 @@ GET  → scope = "GET "  + path
 POST → scope = "POST " + path + "\n" + body
 ```
 
-- 签名的**算法与拼接**完全沿用 `lib/peer.lume`，一个字都没改 —— 它已经出现在
-  所有在跑的节点之间，改一次就是全网 401。
-- 未配 `PEER_SHARED` / `PEER_ROOT` 时，peer 面**整体关闭**(fail-closed)，
-  不是放行。`/peer/health` 的 `mode` 字段会如实报告实际生效的是哪一套。
-- 浏览器**不持有密钥**：同源调用走 `/api/local-invoke` 由服务端代签；
-  跨机调用走 `relay.forward`。这个代理只接受同源目标，否则它会变成一个
-  打穿内网的开放代理。
+- The signature's **algorithm and concatenation** fully follow `lib/peer.lume`, not a single
+  character changed — it already appears between all running nodes; changing it once is a
+  fleet-wide 401.
+- Without `PEER_SHARED` / `PEER_ROOT`, the peer face **shuts down entirely (fail-closed)**,
+  not pass-through. `/peer/health`'s `mode` field honestly reports which scheme is actually
+  in effect.
+- The browser **doesn't hold the key**: same-origin calls go through `/api/local-invoke` and
+  the server signs on its behalf; cross-machine calls go through `relay.forward`. This proxy
+  only accepts same-origin targets, otherwise it becomes an open proxy punching through the
+  internal network.
 
-## 能力一览
+## Capability list
 
-| 能力 | 类型 | 作用 |
+| Capability | Type | Purpose |
 |---|---|---|
-| `node.overview` | query | 身份 / 签名模式 / 能力数 / uptime |
-| `echo.roundtrip` | query | 回显 + 长度, 验证信封完整性与时延 |
-| `facts.aggregate` | compute | 向多个对端取同一事实并标出不一致 |
-| `relay.forward` | relay | 转发到下一跳, 带 hops 上限 |
+| `node.overview` | query | identity / signature mode / capability count / uptime |
+| `echo.roundtrip` | query | echo + length, verifies envelope integrity & latency |
+| `facts.aggregate` | compute | fetch the same fact from multiple peers and flag inconsistencies |
+| `relay.forward` | relay | forward to next hop, with hop limit |
 
-新增能力只需改 `src/catalog.lume` + `src/a2a.lume` 的 `dispatch()` 一处分支，
-面板与 Agent Card 会自动跟上。
+Adding a capability only needs changes to `src/catalog.lume` + one branch in `src/a2a.lume`'s
+`dispatch()`; the panel and Agent Card follow automatically.
 
-## 验收
+## Acceptance
 
-`make verify` 实际输出：
+`make verify` actual output:
 
 ```
-1) Agent Card(公开发现)        card 200 / name / skills / supportedInterfaces
-2) A2A message/send            task / completed / artifacts
-3) 认不出能力 → input-required  不猜能力 / 带提问消息
-4) tasks/get                   查得到 / 不存在 → -32001
-5) peer 签名直连               invoke ok
-6) 错签必须被拒                错签 → unauthorized
-7) 未知工具 → 白名单拒绝         unknown tool
-8) 多跳 relay A → B            completed / 结果来自 node-b
-9) 跳数超限 → rejected          hops-exceeded
-10) facts.aggregate 双节点一致   reachable=2 / consistent
+1) Agent Card (public discovery)   card 200 / name / skills / supportedInterfaces
+2) A2A message/send                task / completed / artifacts
+3) Unrecognized capability → input-required   doesn't guess / carries question message
+4) tasks/get                       retrievable / not found → -32001
+5) peer signed direct              invoke ok
+6) Wrong signature must be rejected   wrong sig → unauthorized
+7) Unknown tool → whitelist rejected   unknown tool
+8) Multi-hop relay A → B           completed / result from node-b
+9) Hop limit → rejected            hops-exceeded
+10) facts.aggregate both nodes consistent   reachable=2 / consistent
 ```
 
-第 6 条是刻意加的：只测"对的签名能过"，等于没测签名。错签必须被拒，
-才说明验签逻辑真的在跑。
+Item 6 is deliberately added: only testing "correct signature passes" is testing nothing. A
+wrong signature must be rejected, or the verification logic isn't actually running.
