@@ -271,7 +271,7 @@ def main() -> int:
         check(f"提示词 {f} 含语境边界", "语境边界" in t, "缺少语境边界声明")
 
 
-    print("\n9) 客户经营: 输出不得含个股")
+    print("\n9) 输出不得含个股(客户经营 + 协商接口)")
     st, oc = get_json(f"{base}/api/outreach", timeout=90)
     check("客户经营接口可用", st == 200 and oc.get("ok") is True, str(oc)[:160])
     # 这条是整个改动的核心约束: 输出落在"行业 + 客户", 不落到个股。
@@ -279,11 +279,18 @@ def main() -> int:
     import re as _re
     raw_oc = json.dumps(oc, ensure_ascii=False)
     codes_oc = _re.findall(r"\b(?:sh|sz|bj)\d{6}\b", raw_oc)
-    check("输出不含任何证券代码", len(codes_oc) == 0, str(codes_oc[:5]))
+    check("客户经营输出不含任何证券代码", len(codes_oc) == 0, str(codes_oc[:5]))
     # 由头里也不能出现买卖方向词
     banned = ["买入", "卖出", "推荐买", "建议持有", "该买", "值得买"]
     hits = [w for w in banned if w in raw_oc]
-    check("由头不含买卖方向词", len(hits) == 0, str(hits))
+    check("客户经营由头不含买卖方向词", len(hits) == 0, str(hits))
+    # 协商页同样是演示给客户端看的, 也不许出现证券代码 —— 否则
+    # "验证协商机制"的页面看起来会像"推荐某只票"(合规)。
+    for ep in ("/api/negotiate", "/api/negotiate/llm"):
+        st2, n2 = get_json(f"{base}{ep}", timeout=90)
+        raw2 = json.dumps(n2, ensure_ascii=False)
+        codes2 = _re.findall(r"\b(?:sh|sz|bj)\d{6}\b", raw2)
+        check(f"{ep} 不含证券代码", len(codes2) == 0, str(codes2[:5]))
     cov_oc = oc.get("coverage") or {}
     check("给出覆盖率与跳过统计", "with_contact" in cov_oc and "skipped" in cov_oc, str(cov_oc))
     # 跳过的每个都要有理由 —— 只丢数字不给原因, 读者会以为那些行业没问题
