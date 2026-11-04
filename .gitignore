@@ -25,6 +25,12 @@ node_modules
 _*.lume
 _probe*.lume
 
+# 构建中间产物: 旧一轮的 bundle 快照, 正式产物是 www/app.js(入库)。
+_app.js
+
+# 本机 Go 构建缓存(经 compose/本地工具链产生), 纯运行态。
+.go-cache/
+
 # Dockerfile 的历史备份。回滚用 git 就够了, 不需要第二份副本 ——
 # 两份同构配置必然分叉, 这是本项目已经在 peer.lume 上踩过的坑。
 *.bak-*
