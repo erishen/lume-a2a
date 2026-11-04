@@ -23,7 +23,8 @@ import "entity.lume" as ent;
 
 // 节点表。地址由环境变量给, 默认值就是本机 make dev 起的两个 peer 进程。
 // 用 PEER_FLEET 覆盖, 格式 "name=host:port,name=host:port"。
-let default_fleet = "crm=127.0.0.1:18102,scanner=127.0.0.1:18103";
+// tsm-hub(LLM 网关能力节点)也进默认 fleet; 本地 make dev 时它跑在 :19070。
+let default_fleet = "crm=127.0.0.1:18102,scanner=127.0.0.1:18103,tsm-hub=127.0.0.1:19070";
 
 func fleet_spec(): string {
   let v = env("PEER_FLEET");

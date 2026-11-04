@@ -33,6 +33,8 @@ const EXAMPLES = [
   "哪个行业的客户推进得最靠前？",
   "今天有哪些标的在放信号？",
   "行情数据更新到哪天了？",
+  "我网关今天烧了多少 token，成本怎么样？",
+  "哪个 provider 在降级或延迟最高？",
 ];
 
 /** 过程里的一条。tool/round 来自 SSE 的 note，其余是本地状态。 */
@@ -40,6 +42,135 @@ type Step =
   | { kind: "tool"; name: string; args: string }
   | { kind: "round"; n: string }
   | { kind: "error"; text: string };
+
+/** HTML 转义（渲染前的第一道，防答案里的 < > 被当标签）。 */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** 拆一行 Markdown 表格：先去掉首尾的管道再按 | 切分并 trim。
+ *  直接 split("|") 会因首尾 | 冒出两个空串，数据行的空单元格（合法）必须保留，
+ *  所以先裁掉首尾管道再切 —— 表头与数据行用同一套逻辑，列数才对得上。 */
+function splitTableRow(row: string): string[] {
+  return row
+    .replace(/^\s*\|/, "")
+    .replace(/\|\s*$/, "")
+    .split("|")
+    .map((c) => c.trim());
+}
+
+/**
+ * 轻量 Markdown 渲染（零依赖，覆盖 agent 答案常见语法）：
+ * 代码块 / 标题 / 加粗 / 斜体 / 行内代码 / 链接 / 引用 / 有序无序列表 / 表格 / 分隔线。
+ * 输出 HTML 字符串，交给 <div dangerouslySetInnerHTML>。类名带 md- 前缀，
+ * 由 .answer-md 作用域样式控制（见 app.css）。
+ */
+function renderMarkdown(md: string): string {
+  if (!md) return "";
+  const codeBlocks: string[] = [];
+  // 1) 先抽出 ``` 代码块，保护内容不被后续规则误伤
+  md = md.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    codeBlocks.push(`<pre class="md-code"><code${lang ? ` class="language-${lang}"` : ""}>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
+    return `\u0000CODE${codeBlocks.length - 1}\u0000`;
+  });
+  // 2) 整体转义
+  md = escapeHtml(md);
+  // 3) 行内语法
+  md = md
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
+    .replace(/`([^`\n]+)`/g, "<code class=\"md-inline\">$1</code>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // 4) 逐行处理块级语法
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inUl = false;
+  let inOl = false;
+  let inQuote = false;
+  let tableRows: string[] = [];
+  const closeLists = () => {
+    if (inUl) { out.push("</ul>"); inUl = false; }
+    if (inOl) { out.push("</ol>"); inOl = false; }
+  };
+  const closeQuote = () => { if (inQuote) { out.push("</blockquote>"); inQuote = false; } };
+  const flushTable = () => {
+    if (tableRows.length < 2) {
+      tableRows.forEach((r) => out.push(`<p>${r}</p>`));
+      tableRows = [];
+      return;
+    }
+    const header = splitTableRow(tableRows[0]);
+    // 正常 Markdown 表格第 2 行是 |---| 分隔行（丢弃）；但若模型没输出分隔行，
+    // 直接 slice(2) 会丢第一条数据。用"全格为短横线/冒号"识别分隔行。
+    const isSep = (row: string) => row.split("|").map((c) => c.trim()).filter((c) => c).every((c) => /^:?-+:?$/.test(c));
+    const body = tableRows.slice(1).filter((r) => !isSep(r));
+    out.push("<table class=\"md-table\"><thead><tr>");
+    header.forEach((c) => out.push(`<th>${c}</th>`));
+    out.push("</tr></thead><tbody>");
+    body.forEach((row) => {
+      const cells = splitTableRow(row);
+      out.push("<tr>");
+      cells.forEach((c) => out.push(`<td>${c}</td>`));
+      out.push("</tr>");
+    });
+    out.push("</tbody></table>");
+    tableRows = [];
+  };
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith("|") && line.endsWith("|")) {
+      closeLists(); closeQuote();
+      tableRows.push(line);
+      continue;
+    }
+    flushTable();
+    if (line === "") { closeLists(); closeQuote(); out.push(""); continue; }
+    const hm = line.match(/^(#{1,6})\s+(.*)$/);
+    if (hm) {
+      closeLists(); closeQuote();
+      const lvl = Math.min(hm[1].length, 6);
+      out.push(`<h${lvl} class="md-h${lvl}">${hm[2]}</h${lvl}>`);
+      continue;
+    }
+    if (/^(-{3,}|\*{3,})$/.test(line)) {
+      closeLists(); closeQuote();
+      out.push("<hr class=\"md-hr\">");
+      continue;
+    }
+    if (line.startsWith(">")) {
+      closeLists();
+      if (!inQuote) { out.push("<blockquote class=\"md-quote\">"); inQuote = true; }
+      out.push(`<p>${line.replace(/^>\s?/, "")}</p>`);
+      continue;
+    }
+    closeQuote();
+    if (/^[-*]\s+/.test(line)) {
+      if (inOl) { out.push("</ol>"); inOl = false; }
+      if (!inUl) { out.push("<ul class=\"md-ul\">"); inUl = true; }
+      out.push(`<li>${line.replace(/^[-*]\s+/, "")}</li>`);
+      continue;
+    }
+    if (/^\d+\.\s+/.test(line)) {
+      if (inUl) { out.push("</ul>"); inUl = false; }
+      if (!inOl) { out.push("<ol class=\"md-ol\">"); inOl = true; }
+      out.push(`<li>${line.replace(/^\d+\.\s+/, "")}</li>`);
+      continue;
+    }
+    closeLists();
+    out.push(`<p>${line}</p>`);
+  }
+  closeLists(); closeQuote(); flushTable();
+  let result = out.join("\n");
+  // 5) 还原代码块
+  result = result.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeBlocks[parseInt(i, 10)] ?? "");
+  // 折叠连续空行产生的空 <p>
+  result = result.replace(/(<p>\s*<\/p>\s*)+/g, "");
+  return result;
+}
 
 export function AskPanel(): React.ReactElement {
   const [q, setQ] = React.useState("");
@@ -236,14 +367,17 @@ function ProcessView({
           {question && <span className="hint">{question}</span>}
         </h2>
         <div className="answer-body">
-          {answer
-            ? answer.split("\n").map((line, i) =>
-                line.trim() === "" ? <br key={i} /> : <p key={i}>{line}</p>,
-              )
-            : <p className="hint">{busy ? "正在组织回答…" : "（无内容）"}</p>}
+          {answer ? (
+            <div
+              className="answer-md"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(answer) }}
+            />
+          ) : (
+            <p className="hint">{busy ? "正在组织回答…" : "（无内容）"}</p>
+          )}
         </div>
         <p className="foot-note">
-          回答由模型基于上述工具返回的数据组织，数据来自 crm / scanner 两个节点，
+          回答由模型基于上述工具返回的数据组织，数据来自 crm / scanner / tsm-hub 三个节点（网关只读），
           不含客户明细。整个过程由 lume 框架的 ReAct 循环驱动，无额外服务进程。
         </p>
       </section>

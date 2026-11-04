@@ -52,6 +52,35 @@ export func scanner_meta() {
   return fleet.invoke("scanner", "scanner.meta", 20);
 }
 
+// ── tsm-hub(LLM 网关能力节点)─────────────────────────────────────────
+// 5 个**无参**能力: 都是"问一句给一个清单/快照"。tsm.skill 需要传技能名,
+// 不注册 —— 模型一旦能填名字就会开始猜, 违反本 agent 的"不猜"承诺。
+
+// tsm.overview: 网关自检。回答"网关活着吗/挂了几个 provider/多少路由"。
+export func tsm_overview() {
+  return fleet.invoke("tsm-hub", "tsm.overview", 20);
+}
+
+// tsm.capabilities: 网关能力目录(工具/技能/MCP 有哪些)。回答"我有什么能用"。
+export func tsm_capabilities() {
+  return fleet.invoke("tsm-hub", "tsm.capabilities", 20);
+}
+
+// tsm.usage: 今日与累计的 token/成本账本(全部 key 汇总)。回答"花了多少钱"。
+export func tsm_usage() {
+  return fleet.invoke("tsm-hub", "tsm.usage", 20);
+}
+
+// tsm.model_health: 各 provider 健康快照(熔断/冷却/延迟)。回答"哪家挂了/在降级"。
+export func tsm_model_health() {
+  return fleet.invoke("tsm-hub", "tsm.model_health", 20);
+}
+
+// tsm.routes: 模型别名 → 候选 provider 路由表。回答"某模型走哪家/权重多少"。
+export func tsm_routes() {
+  return fleet.invoke("tsm-hub", "tsm.routes", 20);
+}
+
 // ── 注册 ──────────────────────────────────────────────────────────────
 // 必须在 route / tool 语句**之前**定义被引用的函数(lume 顶层按声明顺序求值),
 // 所以上面先写好, 这里再注册。
@@ -85,6 +114,21 @@ tool "scanner_picks", "当日扫描选出的标的清单(含信号强度)。回�
 tool "scanner_meta", "行情数据的新鲜度(最新交易日、覆盖股票数)。回答'数据到哪天了'时用。",
      {}, (arg) => { return scanner_meta(); };
 
+tool "tsm_overview", "LLM 网关自检: 运行时长、provider/路由/key/工具数量、A2A 活跃任务数。回答'网关活着吗/挂了几个 provider'时用。",
+     {}, (arg) => { return tsm_overview(); };
+
+tool "tsm_capabilities", "LLM 网关能力目录: 内置工具池、技能库、MCP 服务器清单。回答'我有什么工具能用'时用。",
+     {}, (arg) => { return tsm_capabilities(); };
+
+tool "tsm_usage", "LLM 网关用量账本: 今日与累计的 token 数、请求数、成本。回答'今天花了多少 token/多少钱'时用。",
+     {}, (arg) => { return tsm_usage(); };
+
+tool "tsm_model_health", "LLM 网关 provider 健康快照: 各上游的熔断/冷却/半开/延迟 EWMA。回答'哪家 provider 挂了/在降级'时用。",
+     {}, (arg) => { return tsm_model_health(); };
+
+tool "tsm_routes", "LLM 网关路由表: 模型别名 → 候选 provider 列表(策略/权重), 不含凭据。回答'某模型走哪家/权重多少'时用。",
+     {}, (arg) => { return tsm_routes(); };
+
 // ── 自检 ──────────────────────────────────────────────────────────────
 // 注册是有副作用的(框架侧多一个工具), 而"工具全没注册上"的表现是
 // 模型一本正经地回答"我没有可用的工具" —— 看起来像模型不配合,
@@ -92,7 +136,9 @@ tool "scanner_meta", "行情数据的新鲜度(最新交易日、覆盖股票数
 export func registered() {
   let all = tools();
   let need = ["crm_stats", "crm_industries", "crm_stages",
-              "scanner_picks", "scanner_meta"];
+              "scanner_picks", "scanner_meta",
+              "tsm_overview", "tsm_capabilities", "tsm_usage",
+              "tsm_model_health", "tsm_routes"];
   let miss = [];
   let i = 0;
   while (i < len(need)) {

@@ -15,7 +15,7 @@
  * 收进顶栏与页脚, 不再各占一个标签 —— 它们不构成"一页"。
  */
 import React from "react";
-import type { AgentCard, Capability, NodeState } from "./types";
+import type { AgentCard, Capability, FleetNode, NodeState } from "./types";
 import { fmtTime } from "./types";
 import { api } from "./api";
 import { EntityPanel } from "./Entity";
@@ -41,6 +41,7 @@ function App(): React.ReactElement {
   const [caps, setCaps] = React.useState<Capability[]>([]);
   const [err, setErr] = React.useState("");
   const [showCard, setShowCard] = React.useState(false);
+  const [fleetNodes, setFleetNodes] = React.useState<FleetNode[]>([]);
 
   const refresh = React.useCallback(async () => {
     try {
@@ -51,6 +52,8 @@ function App(): React.ReactElement {
     } catch (e) {
       setErr(String(e));
     }
+    // fleet 单独拉: 它对每个节点发 2 次探测, 失败不该阻塞主身份显示。
+    api.fleet().then((r) => setFleetNodes(r.nodes)).catch(() => {});
   }, []);
 
   React.useEffect(() => {
@@ -92,6 +95,39 @@ function App(): React.ReactElement {
           ))}
         </nav>
       </header>
+
+      {fleetNodes.length > 0 && (
+        <div className="fleet-strip">
+          <span className="fleet-label">
+            peer 节点 <b>{fleetNodes.filter((n) => n.online).length}/{fleetNodes.length}</b> 在线
+          </span>
+          {fleetNodes.map((n) => (
+            <span
+              key={n.name}
+              className="fleet-node"
+              data-tone={n.online ? "ok" : n.error.includes("认证") ? "bad" : "warn"}
+              title={
+                n.online
+                  ? `${n.host} · ${n.mode} · ${n.tools.length} 项能力${n.summary ? "\n" + n.summary : ""}\n能力: ${n.tools
+                        .map((t) => t.name)
+                        .join(", ")}`
+                  : `故障: ${n.error}`
+              }
+            >
+              <span className="dot" data-tone={n.online ? "ok" : "bad"} />
+              <b>{n.name}</b>
+              {n.online ? (
+                <span className="hint">{n.tools.length} 能力 · {n.latency_ms}ms</span>
+              ) : (
+                <span className="hint bad">{n.error}</span>
+              )}
+            </span>
+          ))}
+          <button className="ghost slim" onClick={() => void refresh()}>
+            重新探测
+          </button>
+        </div>
+      )}
 
       <div className="disclaimer">
         <b>技术演示 · 不构成投资建议</b>

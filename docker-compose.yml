@@ -34,7 +34,8 @@ services:
       # Agent Card 里宣告的对外地址。容器内 127.0.0.1 指向自己, 必须显式给。
       PEER_PUBLIC_URL: "http://127.0.0.1:${A2A_PORT:-10190}"
       # 真实节点地址。容器内用 host.docker.internal 指宿主。
-      PEER_FLEET: "${PEER_FLEET:-crm=host.docker.internal:18102,scanner=host.docker.internal:18103}"
+      # tsm-hub = LLM 网关能力节点（工具/技能/MCP 目录 + 用量 + provider 健康，只读）。
+      PEER_FLEET: "${PEER_FLEET:-crm=host.docker.internal:18102,scanner=host.docker.internal:18103,tsm-hub=host.docker.internal:19070}"
       # ── 「问 Agent」页的模型配置 ──
       # 这里传的是**运行时的值**, 不进镜像层: 镜像里只有代码。
       # 框架在启动时读 .env, 而容器的 CWD=/app 里没有 .env(也不该有),

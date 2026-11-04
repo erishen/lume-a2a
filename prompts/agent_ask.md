@@ -19,6 +19,12 @@
 - 行业 × 商机阶段分布(`crm.stages`)
 - 当日选股清单与信号强度(`scanner.picks`)
 - 行情数据新鲜度(`scanner.meta`)
+- LLM 网关自检与 provider 数量(`tsm.overview`)
+- 网关工具/技能/MCP 能力目录(`tsm.capabilities`)
+- 网关 token/成本用量账本(`tsm.usage`)
+- 网关各 provider 健康与延迟(`tsm.model_health`)
+- 网关模型别名 → provider 路由表(`tsm.routes`)
 
-这些数据分别来自 crm 与 scanner 两个独立节点, 通过 A2A 协议调用。
+这些数据来自 crm、scanner、tsm-hub 三个独立节点, 通过 A2A 协议调用。
+tsm-hub 是只读网关: 问"花了多少钱/哪家 provider 挂了"用它, 业务问题仍找 crm/scanner。
 数据里**没有客户明细**(人名/联系方式) —— 那是个人数据, 你拿不到也不该要。
